@@ -3,9 +3,14 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 
 	db "github.com/D-pixel-crime/Endeavor/orchestrator/db"
 	"github.com/joho/godotenv"
+
+	routes "github.com/D-pixel-crime/Endeavor/orchestrator/routes"
+
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -13,16 +18,23 @@ func main() {
 		log.Println("No .env file found")
 	}
 
-	var db, err = db.ConnectToDb()
+	var err = db.ConnectToDb()
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
-	defer db.Close(context.Background())
+	defer db.Conn.Close(context.Background())
 
-	var version string
-	if err := db.QueryRow(context.Background(), "SELECT version()").Scan(&version); err != nil {
-		log.Fatalf("Query failed: %v", err)
+	r := gin.Default()
+
+	getRouter := r.Group("/get")
+	routes.GetRoutes(getRouter)
+
+	postRouter := r.Group("/post")
+	routes.PostRoutes(postRouter)
+
+	port := os.Getenv("PORT")
+	log.Printf("Server is running on port %s", port)
+	if err := r.Run(port); err != nil {
+		log.Fatalf("Failed to run the server: %v", err)
 	}
-
-	log.Println("Connected to:", version)
 }
