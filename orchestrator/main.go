@@ -1,11 +1,11 @@
 package main
 
 import (
-	"context"
 	"log"
 	"os"
 
 	db "github.com/D-pixel-crime/Endeavor/orchestrator/db"
+	shared_vars "github.com/D-pixel-crime/Endeavor/orchestrator/shared"
 	"github.com/joho/godotenv"
 
 	routes "github.com/D-pixel-crime/Endeavor/orchestrator/routes"
@@ -15,14 +15,15 @@ import (
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found")
+		log.Fatalf("Failed to load .env file: %v", err)
 	}
 
-	var err = db.ConnectToDb()
+	var err error
+	shared_vars.Orchestrator_DB_Pool, err = db.ConnectToDb()
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
-	defer db.Conn.Close(context.Background())
+	defer shared_vars.Orchestrator_DB_Pool.Close()
 
 	r := gin.Default()
 
@@ -32,8 +33,8 @@ func main() {
 	postRouter := r.Group("/post")
 	routes.PostRoutes(postRouter)
 
-	port := os.Getenv("PORT")
-	log.Printf("Server is running on port %s", port)
+	port := os.Getenv("ORCHESTRATOR_PORT")
+	log.Printf("Server is starting on port %s", port)
 	if err := r.Run(port); err != nil {
 		log.Fatalf("Failed to run the server: %v", err)
 	}

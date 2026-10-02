@@ -4,8 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	db "github.com/D-pixel-crime/Endeavor/orchestrator/db"
-	models "github.com/D-pixel-crime/Endeavor/orchestrator/db/models"
+	shared_vars "github.com/D-pixel-crime/Endeavor/orchestrator/shared"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -17,9 +16,9 @@ type customerDetails struct {
 }
 
 type reqBody struct {
-	WorkflowID      uuid.UUID           `json:"workflow_id"`
-	WorkflowType    models.WorkflowType `json:"workflow_type"`
-	CustomerDetails customerDetails     `json:"customer_details"`
+	WorkflowID      uuid.UUID                `json:"workflow_id"`
+	WorkflowType    shared_vars.WorkflowType `json:"workflow_type"`
+	CustomerDetails customerDetails          `json:"customer_details"`
 }
 
 func CreateWorkflow(c *gin.Context) {
@@ -39,7 +38,7 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	if req.WorkflowType != models.WORKFLOW_TYPE_TICKET_BOOKING {
+	if req.WorkflowType != shared_vars.WORKFLOW_TYPE_TICKET_BOOKING {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Invalid Workflow Type",
 		})
@@ -63,7 +62,7 @@ func CreateWorkflow(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	tx, err := db.Conn.Begin(ctx)
+	tx, err := shared_vars.Orchestrator_DB_Pool.Begin(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to begin transaction",
@@ -73,7 +72,7 @@ func CreateWorkflow(c *gin.Context) {
 	defer tx.Rollback(ctx)
 
 	var workflowInsert string = `INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '20 seconds') RETURNING id`
-	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, models.WORKFLOW_INITIALIZED, customerDetails)
+	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.WORKFLOW_INITIALIZED, customerDetails)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert workflow",
@@ -82,7 +81,7 @@ func CreateWorkflow(c *gin.Context) {
 	}
 
 	var outboxInsert string = `INSERT INTO outbox (id, processed, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, $5, 15, NOW())`
-	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), false, req.WorkflowID, models.BOOKING_WORKER, customerDetails)
+	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), false, req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert outbox",

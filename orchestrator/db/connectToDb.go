@@ -5,24 +5,21 @@ import (
 	"log"
 	"os"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var Conn *pgx.Conn
-
-func ConnectToDb() error {
-	var err error
-	Conn, err = pgx.Connect(context.Background(), os.Getenv("SUPABASE_DB_URL"))
+func ConnectToDb() (*pgxpool.Pool, error) {
+	pool, err := pgxpool.New(context.Background(), os.Getenv("ORCHESTRATOR_DB_URL"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var version string
-	if err := Conn.QueryRow(context.Background(), "SELECT version()").Scan(&version); err != nil {
-		return err
+	if err = pool.QueryRow(context.Background(), "SELECT version()").Scan(&version); err != nil {
+		return nil, err
 	}
 
 	log.Println("Connected to:", version)
 
-	return nil
+	return pool, nil
 }
