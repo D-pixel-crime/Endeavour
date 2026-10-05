@@ -4,11 +4,11 @@ import (
 	"log"
 	"os"
 
-	db "github.com/D-pixel-crime/Endeavor/orchestrator/db"
-	shared_vars "github.com/D-pixel-crime/Endeavor/orchestrator/shared"
+	db "github.com/D-pixel-crime/Endeavour/orchestrator/db"
+	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/joho/godotenv"
 
-	routes "github.com/D-pixel-crime/Endeavor/orchestrator/routes"
+	routes "github.com/D-pixel-crime/Endeavour/orchestrator/routes"
 
 	"github.com/gin-gonic/gin"
 )

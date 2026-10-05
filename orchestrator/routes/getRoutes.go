@@ -1,7 +1,7 @@
 package routes
 
 import (
-	get_handlers "github.com/D-pixel-crime/Endeavor/orchestrator/handlers/get_handlers"
+	get_handlers "github.com/D-pixel-crime/Endeavour/orchestrator/handlers/get_handlers"
 	"github.com/gin-gonic/gin"
 )
 

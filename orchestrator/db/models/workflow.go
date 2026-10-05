@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/D-pixel-crime/Endeavor/orchestrator/shared"
+	"github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/google/uuid"
 )
 

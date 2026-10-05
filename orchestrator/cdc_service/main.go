@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	db_orchestrator "github.com/D-pixel-crime/Endeavor/orchestrator/db"
+	db_orchestrator "github.com/D-pixel-crime/Endeavour/orchestrator/db"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )

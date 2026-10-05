@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/D-pixel-crime/Endeavor/orchestrator/db/models"
+	"github.com/D-pixel-crime/Endeavour/orchestrator/db/models"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

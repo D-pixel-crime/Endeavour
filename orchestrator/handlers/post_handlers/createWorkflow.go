@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	shared_vars "github.com/D-pixel-crime/Endeavor/orchestrator/shared"
+	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
