@@ -2,14 +2,44 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"os"
 
+	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/producer"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/db/models"
+	"github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func pushToSQS(msg models.OutboxMessage) error {
-	return nil
+func pushBatchToSQS(messages []models.OutboxMessage) (*producer.BatchSendResult, error) {
+	ctx := context.Background()
+
+	queueURL := os.Getenv(string(shared.BOOKING_WORKER) + "_INGRESS_SQS_URL")
+	if queueURL == "" {
+		return nil, fmt.Errorf("queue URL not configured for worker type: %s", shared.BOOKING_WORKER)
+	}
+
+	sqsProducer := producer.NewProducer(sqsClient, queueURL)
+
+	var producerMessages []*producer.Message
+	for _, msg := range messages {
+		var payloadMap map[string]any
+		if len(msg.Payload) > 0 {
+			if err := json.Unmarshal(msg.Payload, &payloadMap); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal payload for message %s: %w", msg.ID, err)
+			}
+		}
+
+		producerMessages = append(producerMessages, &producer.Message{
+			ID:      msg.ID.String(),
+			Type:    string(msg.WorkerType),
+			Payload: payloadMap,
+		})
+	}
+
+	return sqsProducer.SendBatchMessage(ctx, producerMessages)
 }
 
 func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
@@ -22,7 +52,7 @@ func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
 	}
 	defer tx.Rollback(ctx)
 
-	query := `SELECT * FROM outbox WHERE processed=false ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`
+	query := `SELECT * FROM outbox WHERE processed=false AND worker_type='BOOKING' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`
 	rows, err := tx.Query(ctx, query)
 	if err != nil {
 		log.Println("Failed to query outbox: ", err)
@@ -46,17 +76,22 @@ func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
 		return
 	}
 
-	for _, msg := range messages {
-		err := pushToSQS(msg)
-		if err != nil {
-			log.Println("Failed to push to SQS: ", err)
-			continue
-		}
+	res, err := pushBatchToSQS(messages)
+	if err != nil {
+		log.Printf("Failed to push batch to SQS for worker type %s: %v", shared.BOOKING_WORKER, err)
+		return
+	}
 
-		_, err = tx.Exec(ctx, `UPDATE outbox SET processed = true WHERE id = $1`, msg.ID)
+	failedIDs := make(map[string]bool)
+	for _, f := range res.Failed {
+		failedIDs[f.MessageID] = true
+		log.Printf("Failed to send message %s to SQS: %s - %s", f.MessageID, f.Code, f.Message)
+	}
+
+	for _, msgID := range res.Successful {
+		_, err = tx.Exec(ctx, `UPDATE outbox SET processed = true WHERE id = $1`, msgID)
 		if err != nil {
-			log.Println("Failed to update outbox message: ", err)
-			continue
+			log.Printf("Failed to update outbox message %s: %v", msgID, err)
 		}
 	}
 
