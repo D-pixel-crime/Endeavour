@@ -20,12 +20,12 @@ type BatchDeleteResult struct {
 	Failed     []BatchDeleteError
 }
 
-func (consumer *Consumer) DeleteMessageBatch(ctx context.Context, messages []*Message) (*BatchDeleteResult, error) {
+func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message) (*BatchDeleteResult, error) {
 	if len(messages) == 0 {
 		return &BatchDeleteResult{}, nil
 	}
 
-	if len(messages) > 0 {
+	if len(messages) > 10 {
 		return nil, fmt.Errorf("Error! Batch Size exceeds maximum allowed of 10 messages.")
 	}
 
@@ -38,11 +38,11 @@ func (consumer *Consumer) DeleteMessageBatch(ctx context.Context, messages []*Me
 	}
 
 	input := &sqs.DeleteMessageBatchInput{
-		QueueUrl: aws.String(consumer.queueURL),
+		QueueUrl: aws.String(queueURL),
 		Entries:  entries,
 	}
 
-	result, err := consumer.client.DeleteMessageBatch(ctx, input)
+	result, err := client.DeleteMessageBatch(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("Error Deleting Messages in Batch: %w", err)
 	}
@@ -65,4 +65,8 @@ func (consumer *Consumer) DeleteMessageBatch(ctx context.Context, messages []*Me
 	}
 
 	return batchResult, nil
+}
+
+func (consumer *Consumer) DeleteMessageBatch(ctx context.Context, messages []*Message) (*BatchDeleteResult, error) {
+	return DeleteMessageBatch(ctx, consumer.client, consumer.queueURL, messages)
 }

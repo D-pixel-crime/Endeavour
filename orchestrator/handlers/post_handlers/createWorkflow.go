@@ -72,7 +72,7 @@ func CreateWorkflow(c *gin.Context) {
 	defer tx.Rollback(ctx)
 
 	var workflowInsert string = `INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '20 seconds') RETURNING id`
-	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.WORKFLOW_INITIALIZED, customerDetails)
+	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_INITIALIZED, customerDetails)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert workflow",

@@ -31,6 +31,16 @@ type Message struct {
 	Timestamp time.Time      `json:"timestamp"`
 }
 
+func SendMessage(ctx context.Context, client *sqs.Client, queueURL string, msg *Message, delaySeconds int32) (string, error) {
+	p := NewProducer(client, queueURL)
+	return p.SendMessage(ctx, msg, delaySeconds)
+}
+
+func SendFIFOMessage(ctx context.Context, client *sqs.Client, queueURL string, msg *Message, msgGrpID, deduplicationID string) (string, error) {
+	p := NewProducer(client, queueURL)
+	return p.SendFIFOMessage(ctx, msg, msgGrpID, deduplicationID)
+}
+
 func (producer *Producer) SendMessage(
 	ctx context.Context,
 	msg *Message,

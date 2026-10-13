@@ -8,20 +8,19 @@ import (
 	"os"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/producer"
-	"github.com/D-pixel-crime/Endeavour/orchestrator/db/models"
-	"github.com/D-pixel-crime/Endeavour/orchestrator/shared"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/D-pixel-crime/Endeavour/booking/db/models"
 )
 
 func pushBatchToSQS(messages []models.OutboxMessage) (*producer.BatchSendResult, error) {
 	ctx := context.Background()
 
-	queueURL := os.Getenv(string(shared.BOOKING_WORKER) + "_INGRESS_SQS_URL")
+	queueURL := egressQueueURL
 	if queueURL == "" {
-		return nil, fmt.Errorf("queue URL not configured for worker type: %s", shared.BOOKING_WORKER)
+		queueURL = os.Getenv("BOOKING_EGRESS_SQS_URL")
 	}
-
-	sqsProducer := producer.NewProducer(sqsClient, queueURL)
+	if queueURL == "" {
+		return nil, fmt.Errorf("BOOKING_EGRESS_SQS_URL is not configured")
+	}
 
 	var producerMessages []*producer.Message
 	for _, msg := range messages {
@@ -34,25 +33,25 @@ func pushBatchToSQS(messages []models.OutboxMessage) (*producer.BatchSendResult,
 
 		producerMessages = append(producerMessages, &producer.Message{
 			ID:      msg.ID.String(),
-			Type:    string(msg.WorkerType),
+			Type:    msg.WorkerType,
 			Payload: payloadMap,
 		})
 	}
 
-	return sqsProducer.SendBatchMessage(ctx, producerMessages)
+	return producer.SendBatchMessage(ctx, sqsClient, queueURL, producerMessages)
 }
 
-func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
+func ProcessEgressBatch() {
 	ctx := context.Background()
 
-	tx, err := cdc_orchestrator_db_pool.Begin(ctx)
+	tx, err := cdc_booking_db_pool.Begin(ctx)
 	if err != nil {
 		log.Println("Failed to begin transaction: ", err)
 		return
 	}
 	defer tx.Rollback(ctx)
 
-	query := `SELECT * FROM outbox WHERE processed=false AND worker_type='BOOKING' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`
+	query := `SELECT id, workflow_id, worker_type, payload, created_at FROM outbox ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`
 	rows, err := tx.Query(ctx, query)
 	if err != nil {
 		log.Println("Failed to query outbox: ", err)
@@ -64,7 +63,7 @@ func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
 
 	for rows.Next() {
 		var msg models.OutboxMessage
-		if err := rows.Scan(&msg.ID, &msg.Processed, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.TimeoutSeconds, &msg.CreatedAt); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.CreatedAt); err != nil {
 			log.Println("Failed to scan outbox message: ", err)
 			continue
 		}
@@ -78,7 +77,7 @@ func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
 
 	res, err := pushBatchToSQS(messages)
 	if err != nil {
-		log.Printf("Failed to push batch to SQS for worker type %s: %v", shared.BOOKING_WORKER, err)
+		log.Printf("Failed to push batch to SQS: %v", err)
 		return
 	}
 
@@ -88,10 +87,14 @@ func ProcessBatch(cdc_orchestrator_db_pool *pgxpool.Pool) {
 		log.Printf("Failed to send message %s to SQS: %s - %s", f.MessageID, f.Code, f.Message)
 	}
 
-	for _, msgID := range res.Successful {
-		_, err = tx.Exec(ctx, `UPDATE outbox SET processed = true WHERE id = $1`, msgID)
+	for _, msg := range messages {
+		msgID := msg.ID.String()
+		if failedIDs[msgID] {
+			continue
+		}
+		_, err = tx.Exec(ctx, `DELETE FROM outbox WHERE id = $1`, msg.ID)
 		if err != nil {
-			log.Printf("Failed to update outbox message %s: %v", msgID, err)
+			log.Printf("Failed to delete outbox message %s: %v", msgID, err)
 		}
 	}
 

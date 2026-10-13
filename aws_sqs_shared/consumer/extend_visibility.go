@@ -22,6 +22,11 @@ func NewVisibilityExtender(client *sqs.Client, queueURL string) *VisibilityExten
 	}
 }
 
+func ExtendVisibility(ctx context.Context, client *sqs.Client, queueURL string, receiptHandle string, visibilityTimeout int32) error {
+	extender := NewVisibilityExtender(client, queueURL)
+	return extender.ExtendVisibility(ctx, receiptHandle, visibilityTimeout)
+}
+
 func (extender *VisibilityExtender) ExtendVisibility(ctx context.Context, receiptHandle string, visibilityTimeout int32) error {
 	input := &sqs.ChangeMessageVisibilityInput{
 		QueueUrl:          aws.String(extender.queueURL),

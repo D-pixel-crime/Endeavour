@@ -23,6 +23,16 @@ type BatchSendError struct {
 	Message   string
 }
 
+func SendBatchMessage(
+	ctx context.Context,
+	client *sqs.Client,
+	queueURL string,
+	messages []*Message,
+) (*BatchSendResult, error) {
+	p := NewProducer(client, queueURL)
+	return p.SendBatchMessage(ctx, messages)
+}
+
 func (producer *Producer) SendBatchMessage(
 	ctx context.Context,
 	messages []*Message,
@@ -77,7 +87,7 @@ func (producer *Producer) SendBatchMessage(
 	}
 
 	for i, s := range res.Successful {
-		batchRes.Successful[i] = *s.MessageId
+		batchRes.Successful[i] = *s.Id
 	}
 
 	for i, f := range res.Failed {

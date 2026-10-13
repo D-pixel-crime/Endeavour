@@ -7,7 +7,7 @@ import (
 var Orchestrator_DB_Pool *pgxpool.Pool
 
 type WorkerType string
-type WorkflowState string
+type Orchestrator_WorkflowState string
 type WorkflowType string
 
 const (
@@ -16,13 +16,13 @@ const (
 )
 
 const (
-	WORKFLOW_INITIALIZED  WorkflowState = "INITIALIZED"
-	WORKFLOW_PENDING      WorkflowState = "PENDING"
-	WORKFLOW_BOOKING      WorkflowState = "BOOKING"
-	WORKFLOW_PAYMENT      WorkflowState = "PAYMENT"
-	WORKFLOW_COMPLETED    WorkflowState = "COMPLETED"
-	WORKFLOW_FAILED       WorkflowState = "FAILED"
-	WORKFLOW_COMPENSATING WorkflowState = "COMPENSATING"
+	ORCHESTRATOR_WORKFLOW_INITIALIZED  Orchestrator_WorkflowState = "INITIALIZED"
+	ORCHESTRATOR_WORKFLOW_PENDING      Orchestrator_WorkflowState = "PENDING"
+	ORCHESTRATOR_WORKFLOW_BOOKING      Orchestrator_WorkflowState = "BOOKING"
+	ORCHESTRATOR_WORKFLOW_PAYMENT      Orchestrator_WorkflowState = "PAYMENT"
+	ORCHESTRATOR_WORKFLOW_COMPLETED    Orchestrator_WorkflowState = "COMPLETED"
+	ORCHESTRATOR_WORKFLOW_FAILED       Orchestrator_WorkflowState = "FAILED"
+	ORCHESTRATOR_WORKFLOW_COMPENSATING Orchestrator_WorkflowState = "COMPENSATING"
 )
 
 const (

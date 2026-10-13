@@ -18,8 +18,8 @@ type Message struct {
 	Type          string            `json:"type"`
 	Payload       map[string]any    `json:"payload"`
 	Timestamp     time.Time         `json:"timestamp"`
-	ReceiptHandle string            `json:"-"` // hide this field from Marshalling and Unmarshalling
-	Attributes    map[string]string `json:"-"` // hide this field from Marshalling and Unmarshalling
+	ReceiptHandle string            `json:"-"`
+	Attributes    map[string]string `json:"-"`
 }
 
 type Handler func(ctx context.Context, msg *Message) error
@@ -50,7 +50,7 @@ func NewConsumer(client *sqs.Client, cfg ConsumerConfig, handler Handler) *Consu
 		cfg.VisibilityTimeout = 30
 	}
 	if cfg.WaitTimeSeconds != 0 {
-		cfg.WaitTimeSeconds = 0 // We Want SHORT POLLING !!!!!!!!!!!!!!!!!!!!!!!!!
+		cfg.WaitTimeSeconds = 0
 	}
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = 5
@@ -67,18 +67,22 @@ func NewConsumer(client *sqs.Client, cfg ConsumerConfig, handler Handler) *Consu
 	}
 }
 
-func (consumer *Consumer) deleteMessage(ctx context.Context, receiptHandle string) error {
+func DeleteMessage(ctx context.Context, client *sqs.Client, queueURL string, receiptHandle string) error {
 	input := &sqs.DeleteMessageInput{
-		QueueUrl:      aws.String(consumer.queueURL),
+		QueueUrl:      aws.String(queueURL),
 		ReceiptHandle: aws.String(receiptHandle),
 	}
 
-	_, err := consumer.client.DeleteMessage(ctx, input)
+	_, err := client.DeleteMessage(ctx, input)
 	if err != nil {
 		return fmt.Errorf("Error Deleting Message: %w", err)
 	}
 
 	return nil
+}
+
+func (consumer *Consumer) DeleteMessage(ctx context.Context, receiptHandle string) error {
+	return DeleteMessage(ctx, consumer.client, consumer.queueURL, receiptHandle)
 }
 
 func (consumer *Consumer) processMessage(ctx context.Context, msg *Message) {
@@ -91,7 +95,7 @@ func (consumer *Consumer) processMessage(ctx context.Context, msg *Message) {
 		return
 	}
 
-	if err := consumer.deleteMessage(ctx, msg.ReceiptHandle); err != nil {
+	if err := consumer.DeleteMessage(ctx, msg.ReceiptHandle); err != nil {
 		log.Printf("Error Deleting Message %s: %v", msg.ID, err)
 	}
 }
@@ -107,25 +111,32 @@ func (consumer *Consumer) worker(ctx context.Context, id int, msgChan <-chan *Me
 	}
 }
 
-func (consumer *Consumer) receiveMessages(ctx context.Context) ([]*Message, error) {
+func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, maxMessages int32, waitTimeSeconds int32, visibilityTimeout int32) ([]*Message, error) {
+	if maxMessages <= 0 || maxMessages > 10 {
+		maxMessages = 10
+	}
+	if visibilityTimeout <= 0 {
+		visibilityTimeout = 30
+	}
+
 	input := &sqs.ReceiveMessageInput{
-		QueueUrl:              aws.String(consumer.queueURL),
-		MaxNumberOfMessages:   consumer.maxMessages,
-		VisibilityTimeout:     consumer.visibilityTimeout,
-		WaitTimeSeconds:       consumer.waitTimeSeconds,
+		QueueUrl:              aws.String(queueURL),
+		MaxNumberOfMessages:   maxMessages,
+		VisibilityTimeout:     visibilityTimeout,
+		WaitTimeSeconds:       waitTimeSeconds,
 		MessageAttributeNames: []string{"All"},
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameAll,
 		},
 	}
 
-	result, err := consumer.client.ReceiveMessage(ctx, input)
+	result, err := client.ReceiveMessage(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("Error Receiving Messages: %w", err)
 	}
 
-	messages := make([]*Message, len(result.Messages))
-	for i, sqsMsg := range result.Messages {
+	messages := make([]*Message, 0, len(result.Messages))
+	for _, sqsMsg := range result.Messages {
 		var msg Message
 		if err := json.Unmarshal([]byte(*sqsMsg.Body), &msg); err != nil {
 			log.Printf("Error Unmarshalling Message %s: %v", *sqsMsg.MessageId, err)
@@ -134,10 +145,18 @@ func (consumer *Consumer) receiveMessages(ctx context.Context) ([]*Message, erro
 
 		msg.ReceiptHandle = *sqsMsg.ReceiptHandle
 		msg.Attributes = sqsMsg.Attributes
-		messages[i] = &msg
+		messages = append(messages, &msg)
 	}
 
 	return messages, nil
+}
+
+func ReceiveBatch(ctx context.Context, client *sqs.Client, queueURL string, maxMessages int32) ([]*Message, error) {
+	return ReceiveMessages(ctx, client, queueURL, maxMessages, 0, 30)
+}
+
+func (consumer *Consumer) ReceiveMessages(ctx context.Context) ([]*Message, error) {
+	return ReceiveMessages(ctx, consumer.client, consumer.queueURL, consumer.maxMessages, consumer.waitTimeSeconds, consumer.visibilityTimeout)
 }
 
 func (consumer *Consumer) poll(ctx context.Context, msgChan chan<- *Message) {
@@ -147,7 +166,7 @@ func (consumer *Consumer) poll(ctx context.Context, msgChan chan<- *Message) {
 			return
 
 		default:
-			messages, err := consumer.receiveMessages(ctx)
+			messages, err := consumer.ReceiveMessages(ctx)
 			if err != nil {
 				log.Printf("Error Receiving Messages: %v", err)
 				time.Sleep(time.Second)
@@ -156,7 +175,7 @@ func (consumer *Consumer) poll(ctx context.Context, msgChan chan<- *Message) {
 
 			for _, msg := range messages {
 				select {
-				case msgChan <- msg: // these both cases are different, dont try to merge them (its not a switch statement)!
+				case msgChan <- msg:
 				case <-ctx.Done():
 					return
 				}

@@ -2,7 +2,7 @@ CREATE TYPE workflow_type as ENUM (
     'TICKET_BOOKING'
 );
 
-CREATE TYPE workflow_state as ENUM (
+CREATE TYPE orchestrator_workflow_state as ENUM (
     'INITIALIZED',
     'PENDING',
     'BOOKING',
