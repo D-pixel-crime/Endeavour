@@ -10,14 +10,16 @@ import (
 )
 
 type customerDetails struct {
-	Email    string `json:"email"`
-	FullName string `json:"full_name"`
-	Contact  int64  `json:"contact"`
+	Email         string `json:"email"`
+	FullName      string `json:"full_name"`
+	Contact       int64  `json:"contact"`
+	PaymentMethod string `json:"payment_method,omitempty"`
 }
 
 type reqBody struct {
 	WorkflowID      uuid.UUID                `json:"workflow_id"`
 	WorkflowType    shared_vars.WorkflowType `json:"workflow_type"`
+	PaymentMethod   string                   `json:"payment_method,omitempty"`
 	CustomerDetails customerDetails          `json:"customer_details"`
 }
 
@@ -29,6 +31,10 @@ func CreateWorkflow(c *gin.Context) {
 			"error": err.Error(),
 		})
 		return
+	}
+
+	if req.CustomerDetails.PaymentMethod == "" && req.PaymentMethod != "" {
+		req.CustomerDetails.PaymentMethod = req.PaymentMethod
 	}
 
 	if req.WorkflowID == uuid.Nil {

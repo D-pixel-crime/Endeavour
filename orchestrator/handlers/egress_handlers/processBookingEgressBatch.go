@@ -159,6 +159,10 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		}
 	}
 
+	if pm, ok := currentPayload["payment_method"]; ok {
+		paymentPayload["payment_method"] = pm
+	}
+
 	paymentPayloadBytes, err := json.Marshal(paymentPayload)
 	if err != nil {
 		return false, fmt.Errorf("failed to marshal payment outbox payload for %s: %w", workflowUUID, err)
