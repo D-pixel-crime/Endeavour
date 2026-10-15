@@ -11,39 +11,92 @@ import (
 	"github.com/google/uuid"
 )
 
-func processMessage(ctx context.Context, msg *consumer.Message) error {
-	numSeatsRaw, ok := msg.Payload["num_seats"]
-	if !ok {
-		return fmt.Errorf("missing num_seats in message payload (id=%s)", msg.ID)
+type BookingIngressPayload struct {
+	WorkflowID string `json:"workflow_id"`
+	NumSeats   int    `json:"num_seats"`
+}
+
+func deleteFromIngress(ctx context.Context, msg *consumer.Message) {
+	if shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
+		return
+	}
+	if err := consumer.DeleteMessage(ctx, shared.IngressSQSClient, shared.IngressQueueURL, msg.ReceiptHandle); err != nil {
+		log.Printf("Failed to delete SQS message %s: %v", msg.ID, err)
+	}
+}
+
+// ProcessBookingIngressMessage handles a single message from the booking ingress queue.
+// It returns (shouldDelete, error). If shouldDelete is true, the message can be removed from SQS.
+func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
+	if msg == nil {
+		return false, fmt.Errorf("nil message received")
 	}
 
-	numSeatsFloat, ok := numSeatsRaw.(float64)
-	if !ok || numSeatsFloat <= 0 {
-		return fmt.Errorf("invalid num_seats value %v in message (id=%s)", numSeatsRaw, msg.ID)
+	if msg.Payload == nil {
+		return false, fmt.Errorf("message payload is nil (id=%s)", msg.ID)
 	}
-	numSeats := int(numSeatsFloat)
 
-	workflowID, err := uuid.Parse(msg.ID)
+	payloadBytes, err := json.Marshal(msg.Payload)
 	if err != nil {
-		return fmt.Errorf("message ID is not a valid UUID (id=%s): %w", msg.ID, err)
+		return false, fmt.Errorf("failed to marshal message payload (id=%s): %w", msg.ID, err)
+	}
+
+	var ingressPayload BookingIngressPayload
+	if err := json.Unmarshal(payloadBytes, &ingressPayload); err != nil {
+		return false, fmt.Errorf("failed to unmarshal booking ingress payload (id=%s): %w", msg.ID, err)
+	}
+
+	if ingressPayload.WorkflowID == "" && msg.ID != "" {
+		ingressPayload.WorkflowID = msg.ID
+	}
+
+	workflowUUID, err := uuid.Parse(ingressPayload.WorkflowID)
+	if err != nil {
+		return false, fmt.Errorf("invalid workflow ID '%s' in message (id=%s): %w", ingressPayload.WorkflowID, msg.ID, err)
+	}
+
+	if ingressPayload.NumSeats <= 0 {
+		if rawNumSeats, ok := msg.Payload["num_seats"]; ok {
+			if numSeatsFloat, ok := rawNumSeats.(float64); ok && numSeatsFloat > 0 {
+				ingressPayload.NumSeats = int(numSeatsFloat)
+			}
+		}
+	}
+	if ingressPayload.NumSeats <= 0 {
+		return false, fmt.Errorf("missing or invalid num_seats in message payload (id=%s)", msg.ID)
+	}
+
+	if shared.DBPool == nil {
+		return false, fmt.Errorf("database pool is not initialized")
 	}
 
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return false, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
+	// Idempotency check: if workflow already completed, do not reserve seats again
+	var existingState string
+	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
+	if err == nil {
+		if existingState == string(shared.BOOKING_WORKFLOW_COMPLETED) {
+			log.Printf("Workflow %s is already in state %s; skipping duplicate processing", workflowUUID, existingState)
+			return true, nil
+		}
+	}
+
+	// Query available seats with FOR UPDATE SKIP LOCKED
 	rows, err := tx.Query(ctx,
 		`SELECT id FROM seat
 		 WHERE is_booked = false
 		 ORDER BY seat_number
 		 LIMIT $1
 		 FOR UPDATE SKIP LOCKED`,
-		numSeats,
+		ingressPayload.NumSeats,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to query available seats: %w", err)
+		return false, fmt.Errorf("failed to query available seats: %w", err)
 	}
 
 	var seatIDs []uuid.UUID
@@ -51,7 +104,7 @@ func processMessage(ctx context.Context, msg *consumer.Message) error {
 		var seatID uuid.UUID
 		if err := rows.Scan(&seatID); err != nil {
 			rows.Close()
-			return fmt.Errorf("failed to scan seat id: %w", err)
+			return false, fmt.Errorf("failed to scan seat id: %w", err)
 		}
 		seatIDs = append(seatIDs, seatID)
 	}
@@ -60,14 +113,14 @@ func processMessage(ctx context.Context, msg *consumer.Message) error {
 	workflowState := shared.BOOKING_WORKFLOW_COMPLETED
 	var outboxPayload map[string]any
 
-	if len(seatIDs) < numSeats {
+	if len(seatIDs) < ingressPayload.NumSeats {
 		log.Printf("insufficient seats for workflow %s: requested=%d available=%d",
-			workflowID, numSeats, len(seatIDs))
+			workflowUUID, ingressPayload.NumSeats, len(seatIDs))
 		workflowState = shared.BOOKING_WORKFLOW_FAILED
 		outboxPayload = map[string]any{
-			"workflow_id": workflowID.String(),
+			"workflow_id": workflowUUID.String(),
 			"status":      "FAILED",
-			"reason":      fmt.Sprintf("insufficient seats: requested %d, available %d", numSeats, len(seatIDs)),
+			"reason":      fmt.Sprintf("insufficient seats: requested %d, available %d", ingressPayload.NumSeats, len(seatIDs)),
 		}
 	} else {
 		seatIDStrings := make([]string, len(seatIDs))
@@ -80,76 +133,69 @@ func processMessage(ctx context.Context, msg *consumer.Message) error {
 			seatIDStrings,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to update seats: %w", err)
+			return false, fmt.Errorf("failed to update seats: %w", err)
 		}
 
 		outboxPayload = map[string]any{
-			"workflow_id": workflowID.String(),
+			"workflow_id": workflowUUID.String(),
 			"status":      "COMPLETED",
 			"seat_ids":    seatIDStrings,
-			"num_seats":   numSeats,
+			"num_seats":   ingressPayload.NumSeats,
 		}
-	}
-
-	payloadBytes, err := json.Marshal(msg.Payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal workflow payload: %w", err)
 	}
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO workflows (id, workflow_state, payload)
 		 VALUES ($1, $2, $3)
 		 ON CONFLICT (id) DO UPDATE
-		   SET workflow_state = EXCLUDED.workflow_state`,
-		workflowID, string(workflowState), payloadBytes,
+		   SET workflow_state = EXCLUDED.workflow_state,
+		       payload = EXCLUDED.payload`,
+		workflowUUID, string(workflowState), payloadBytes,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to upsert workflow: %w", err)
+		return false, fmt.Errorf("failed to upsert workflow: %w", err)
 	}
 
+	// Create outbox message for CDC poller to push to SQS
 	outboxID := uuid.New()
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal outbox payload: %w", err)
+		return false, fmt.Errorf("failed to marshal outbox payload: %w", err)
 	}
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO outbox (id, workflow_id, worker_type, payload)
-		 VALUES ($1, $2, 'BOOKING', $3)`,
-		outboxID, workflowID, outboxPayloadBytes,
+		`INSERT INTO outbox (id, workflow_id, worker_type, payload, created_at)
+		 VALUES ($1, $2, 'BOOKING', $3, NOW())`,
+		outboxID, workflowUUID, outboxPayloadBytes,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to insert outbox entry: %w", err)
+		return false, fmt.Errorf("failed to insert outbox entry: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return false, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	log.Printf("workflow %s processed: state=%s seats_booked=%d",
-		workflowID, workflowState, len(seatIDs))
-
-	return nil
+	log.Printf("Workflow %s processed: state=%s seats_booked=%d; outbox message %s created",
+		workflowUUID, workflowState, len(seatIDs), outboxID)
+	return true, nil
 }
 
-func deleteFromIngress(ctx context.Context, msg *consumer.Message) {
-	if err := consumer.DeleteMessage(ctx, shared.IngressSQSClient, shared.IngressQueueURL, msg.ReceiptHandle); err != nil {
-		log.Printf("failed to delete SQS message %s: %v", msg.ID, err)
-	}
-}
-
+// ProcessIngressBatch processes a batch of messages from the booking ingress SQS queue.
 func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
 
-		err := processMessage(ctx, msg)
+		shouldDelete, err := ProcessBookingIngressMessage(ctx, msg)
 		if err != nil {
-			log.Printf("error processing message %s: %v", msg.ID, err)
+			log.Printf("Error processing message %s: %v", msg.ID, err)
 			continue
 		}
 
-		deleteFromIngress(ctx, msg)
+		if shouldDelete {
+			deleteFromIngress(ctx, msg)
+		}
 	}
 }

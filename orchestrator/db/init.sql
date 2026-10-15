@@ -20,7 +20,7 @@ CREATE TYPE worker_type as ENUM(
 CREATE TABLE workflows (
     id UUID PRIMARY KEY,
     workflow_type workflow_type NOT NULL,
-    workflow_state workflow_state NOT NULL,
+    workflow_state orchestrator_workflow_state NOT NULL,
     payload JSONB,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMP,

@@ -12,27 +12,26 @@ func StartPoller(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	log.Printf("Booking Ingress Poller started (interval: %v)", interval)
+
 	for {
 		select {
 		case <-ctx.Done():
-			log.Print("Booking Poller is Stopping!")
+			log.Print("Booking Ingress Poller is stopping!")
 			return
 
 		case <-ticker.C:
-			{
-				messages, err := PullBatchFromSQS(ctx)
-				if err != nil {
-					log.Print("Failed to Pull Messages from SQS!")
-					continue
-				}
-
-				if len(messages) == 0 {
-					log.Print("No messages received from SQS")
-					continue
-				}
-
-				go handlers.ProcessIngressBatch(ctx, messages)
+			messages, err := PullBatchFromSQS(ctx)
+			if err != nil {
+				log.Printf("Failed to pull messages from booking ingress SQS: %v", err)
+				continue
 			}
+
+			if len(messages) == 0 {
+				continue
+			}
+
+			go handlers.ProcessIngressBatch(ctx, messages)
 		}
 	}
 }

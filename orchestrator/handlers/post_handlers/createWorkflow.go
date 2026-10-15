@@ -80,8 +80,8 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	var outboxInsert string = `INSERT INTO outbox (id, processed, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, $5, 15, NOW())`
-	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), false, req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails)
+	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, 15, NOW())`
+	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert outbox",

@@ -1,10 +1,15 @@
 package shared
 
 import (
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var Orchestrator_DB_Pool *pgxpool.Pool
+var (
+	Orchestrator_DB_Pool   *pgxpool.Pool
+	BookingEgressSQSClient *sqs.Client
+	BookingEgressQueueURL  string
+)
 
 type WorkerType string
 type Orchestrator_WorkflowState string

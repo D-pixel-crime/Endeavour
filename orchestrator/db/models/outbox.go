@@ -10,7 +10,6 @@ import (
 
 type OutboxMessage struct {
 	ID             uuid.UUID         `db:"id"`
-	Processed      bool              `db:"processed"`
 	WorkflowID     uuid.UUID         `db:"workflow_id"`
 	WorkerType     shared.WorkerType `db:"worker_type"`
 	Payload        json.RawMessage   `db:"payload"`

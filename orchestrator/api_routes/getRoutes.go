@@ -1,4 +1,4 @@
-package routes
+package api_routes
 
 import (
 	get_handlers "github.com/D-pixel-crime/Endeavour/orchestrator/handlers/get_handlers"
