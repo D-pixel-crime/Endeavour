@@ -35,7 +35,8 @@ CREATE TABLE payments (
     payment_method VARCHAR(255),
     status VARCHAR(50) NOT NULL DEFAULT 'COMPLETED',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE
+    FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE,
+    CONSTRAINT uq_payments_workflow_id UNIQUE (workflow_id)
 );
 
 CREATE INDEX idx_outbox_created_at ON outbox(created_at);

@@ -21,17 +21,29 @@ type BookingEgressPayload struct {
 	Reason     string   `json:"reason,omitempty"`
 }
 
-func deleteFromBookingEgress(ctx context.Context, msg *consumer.Message) {
-	if shared_vars.BookingEgressSQSClient == nil || shared_vars.BookingEgressQueueURL == "" {
+func deleteBatchFromBookingEgress(ctx context.Context, messages []*consumer.Message) {
+	if len(messages) == 0 || shared_vars.BookingEgressSQSClient == nil || shared_vars.BookingEgressQueueURL == "" {
 		return
 	}
-	if err := consumer.DeleteMessage(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, msg.ReceiptHandle); err != nil {
-		log.Printf("Failed to delete SQS message %s: %v", msg.ID, err)
+
+	for i := 0; i < len(messages); i += 10 {
+		end := min(i+10, len(messages))
+		chunk := messages[i:end]
+
+		result, err := consumer.DeleteMessageBatch(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, chunk)
+		if err != nil {
+			log.Printf("Failed to batch delete booking egress SQS messages: %v", err)
+			continue
+		}
+
+		if len(result.Failed) > 0 {
+			for _, f := range result.Failed {
+				log.Printf("Failed to delete booking egress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
+			}
+		}
 	}
 }
 
-// ProcessBookingEgressMessage handles a single message from the booking egress queue.
-// It returns (shouldDelete, error). If shouldDelete is true, the message can be removed from SQS.
 func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
 		return false, fmt.Errorf("nil message received")
@@ -60,7 +72,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("invalid workflow ID '%s' in message (id=%s): %w", egressPayload.WorkflowID, msg.ID, err)
 	}
 
-	// Currently only focus on successful transactions; skip failure cases for later
 	if egressPayload.Status != "COMPLETED" {
 		log.Printf("Workflow %s booking status is '%s' (not COMPLETED). Skipping failure handling for now.", workflowUUID, egressPayload.Status)
 		return false, nil
@@ -76,7 +87,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 	defer tx.Rollback(ctx)
 
-	// Fetch existing workflow with row-level lock
 	var wf models.Workflow
 	queryWorkflow := `SELECT id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout FROM workflows WHERE id = $1 FOR UPDATE`
 	err = tx.QueryRow(ctx, queryWorkflow, workflowUUID).Scan(
@@ -95,13 +105,11 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to query workflow %s: %w", workflowUUID, err)
 	}
 
-	// Idempotency check: if already transitioned to PAYMENT or COMPLETED, do not duplicate
 	if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT || wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED {
 		log.Printf("Workflow %s is already in state %s; skipping duplicate processing", workflowUUID, wf.WorkflowState)
 		return true, nil
 	}
 
-	// Unmarshal existing payload to preserve customer_details and merge booking results
 	var currentPayload map[string]any
 	if len(wf.Payload) > 0 {
 		if err := json.Unmarshal(wf.Payload, &currentPayload); err != nil {
@@ -113,7 +121,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		currentPayload = make(map[string]any)
 	}
 
-	// Merge booking info into workflow payload
 	currentPayload["booking"] = map[string]any{
 		"status":    egressPayload.Status,
 		"seat_ids":  egressPayload.SeatIDs,
@@ -127,14 +134,12 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to marshal updated workflow payload for %s: %w", workflowUUID, err)
 	}
 
-	// Update workflows table: transition state to PAYMENT and set next state timeout
 	updateWorkflowQuery := `UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '30 seconds' WHERE id = $3`
 	_, err = tx.Exec(ctx, updateWorkflowQuery, shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT, updatedWorkflowPayload, workflowUUID)
 	if err != nil {
 		return false, fmt.Errorf("failed to update workflow %s: %w", workflowUUID, err)
 	}
 
-	// Calculate payment amount (cost per seat is 500)
 	numSeats := egressPayload.NumSeats
 	if numSeats <= 0 && len(egressPayload.SeatIDs) > 0 {
 		numSeats = len(egressPayload.SeatIDs)
@@ -148,7 +153,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		"amount":      amount,
 	}
 
-	// Pass customer details to payment worker
 	if customerDetails, ok := currentPayload["customer_details"]; ok {
 		paymentPayload["customer_details"] = customerDetails
 	} else if email, ok := currentPayload["email"]; ok {
@@ -168,7 +172,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to marshal payment outbox payload for %s: %w", workflowUUID, err)
 	}
 
-	// Create outbox message for PAYMENT worker
 	outboxID := uuid.New()
 	outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, 15, NOW())`
 	_, err = tx.Exec(ctx, outboxInsert, outboxID, workflowUUID, shared_vars.PAYMENT_WORKER, paymentPayloadBytes)
@@ -184,8 +187,9 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	return true, nil
 }
 
-// ProcessBookingEgressBatch processes a batch of messages from the booking egress SQS queue.
 func ProcessBookingEgressBatch(ctx context.Context, messages []*consumer.Message) {
+	var toDelete []*consumer.Message
+
 	for _, msg := range messages {
 		if msg == nil {
 			continue
@@ -198,7 +202,11 @@ func ProcessBookingEgressBatch(ctx context.Context, messages []*consumer.Message
 		}
 
 		if shouldDelete {
-			deleteFromBookingEgress(ctx, msg)
+			toDelete = append(toDelete, msg)
 		}
+	}
+
+	if len(toDelete) > 0 {
+		deleteBatchFromBookingEgress(ctx, toDelete)
 	}
 }

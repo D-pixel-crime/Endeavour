@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -74,7 +75,17 @@ func main() {
 		}
 	}()
 
-	go poller.StartPoller(ctx, time.Duration(poll_interval_sec)*time.Second)
+	maxConcurrentPulls := 5
+	if maxConcurrentStr := os.Getenv("BOOKING_MAX_CONCURRENT_PULLS"); maxConcurrentStr != "" {
+		if n, err := strconv.Atoi(maxConcurrentStr); err == nil && n > 0 {
+			maxConcurrentPulls = n
+		}
+	}
+
+	var pollerWg sync.WaitGroup
+	pollerWg.Go(func() {
+		poller.StartPoller(ctx, time.Duration(poll_interval_sec)*time.Second, maxConcurrentPulls)
+	})
 
 	<-ctx.Done()
 	log.Print("Shutting down Booking Worker...")
@@ -84,6 +95,19 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server shutdown error: %v", err)
+	}
+
+	pollersDone := make(chan struct{})
+	go func() {
+		pollerWg.Wait()
+		close(pollersDone)
+	}()
+
+	select {
+	case <-pollersDone:
+		log.Println("Booking ingress poller stopped cleanly")
+	case <-shutdownCtx.Done():
+		log.Println("Timed out waiting for booking ingress poller to stop")
 	}
 
 	log.Println("Shutdown complete")

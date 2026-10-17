@@ -40,7 +40,8 @@ CREATE TABLE seat (
 CREATE INDEX idx_outbox_created_at ON outbox(created_at);
 CREATE INDEX idx_seat_available ON seat(train_id, seat_number) WHERE is_booked = false;
 
--- Initial seed: 10,000 seats for TRAIN-1 (is_booked initialized to false)
+-- Initial Seed of 100 Seats
+
 INSERT INTO seat (train_id, seat_number)
 SELECT
     'TRAIN-1',

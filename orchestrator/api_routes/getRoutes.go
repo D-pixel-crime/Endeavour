@@ -7,4 +7,8 @@ import (
 
 func GetRoutes(getRouter *gin.RouterGroup) {
 	getRouter.GET("/workflow_id", get_handlers.GenerateWorkflowID)
+	getRouter.GET("/ticket/:workflow_id", get_handlers.GetTicketByWorkflowID)
+	getRouter.GET("/tickets/:workflow_id", get_handlers.GetTicketByWorkflowID)
+	getRouter.GET("/workflow/:workflow_id", get_handlers.GetWorkflowByID)
 }
+

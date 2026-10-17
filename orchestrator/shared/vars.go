@@ -9,6 +9,8 @@ var (
 	Orchestrator_DB_Pool   *pgxpool.Pool
 	BookingEgressSQSClient *sqs.Client
 	BookingEgressQueueURL  string
+	PaymentEgressSQSClient *sqs.Client
+	PaymentEgressQueueURL  string
 )
 
 type WorkerType string

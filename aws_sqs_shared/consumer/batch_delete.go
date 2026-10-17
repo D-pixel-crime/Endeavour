@@ -31,8 +31,12 @@ func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string
 
 	entries := make([]types.DeleteMessageBatchRequestEntry, len(messages))
 	for i, msg := range messages {
+		entryID := msg.ID
+		if entryID == "" {
+			entryID = fmt.Sprintf("msg-%d", i)
+		}
 		entries[i] = types.DeleteMessageBatchRequestEntry{
-			Id:            aws.String(msg.ID),
+			Id:            aws.String(entryID),
 			ReceiptHandle: aws.String(msg.ReceiptHandle),
 		}
 	}

@@ -25,10 +25,7 @@ type Config struct {
 	BatchSize    int
 	HTTPPort     string
 
-	// Single mode queue URL
 	TargetQueueURL string
-
-	// Multi mode queue URLs: map[worker_type]queue_url
 	TargetQueues map[string]string
 }
 
@@ -40,7 +37,6 @@ func LoadConfig() (*Config, error) {
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		// Attempt to construct from DB_* variables
 		user := os.Getenv("DB_USER")
 		pass := os.Getenv("DB_PASSWORD")
 		host := os.Getenv("DB_HOST")
@@ -87,7 +83,7 @@ func LoadConfig() (*Config, error) {
 		}
 		if parsed > 10 {
 			log.Printf("Reducing Batch size to a maximum of 10!")
-			parsed = 10 // AWS SQS SendMessageBatch maximum is 10
+			parsed = 10
 		}
 		batchSize = parsed
 	}
@@ -111,7 +107,6 @@ func LoadConfig() (*Config, error) {
 
 	targetQueues := make(map[string]string)
 
-	// 1. Check TARGET_QUEUES (comma separated WORKER:URL,WORKER:URL)
 	if multiStr := os.Getenv("TARGET_QUEUES"); multiStr != "" {
 		pairs := strings.SplitSeq(multiStr, ",")
 		for pair := range pairs {
@@ -126,7 +121,6 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	// 2. Check TARGET_QUEUE_<WORKER> pattern
 	for _, env := range os.Environ() {
 		if strings.HasPrefix(env, "TARGET_QUEUE_") {
 			parts := strings.SplitN(env, "=", 2)
@@ -137,7 +131,6 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	// 3. Fallbacks for known queues if not already defined
 	if _, ok := targetQueues["BOOKING"]; !ok {
 		if u := os.Getenv("BOOKING_INGRESS_SQS_URL"); u != "" {
 			targetQueues["BOOKING"] = u
@@ -168,7 +161,6 @@ func LoadConfig() (*Config, error) {
 	case "MULTI", "DUAL":
 		mode = ModeMulti
 	default:
-		// Auto-detect: if multi-queues configured and > 1, default to MULTI; otherwise SINGLE
 		if len(targetQueues) > 1 {
 			mode = ModeMulti
 		} else {
@@ -178,7 +170,6 @@ func LoadConfig() (*Config, error) {
 
 	if mode == ModeSingle {
 		if singleQueueURL == "" && len(targetQueues) == 1 {
-			// Single entry in targetQueues can serve as the single queue
 			for _, u := range targetQueues {
 				singleQueueURL = u
 				break

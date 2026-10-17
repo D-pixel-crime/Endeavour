@@ -38,3 +38,19 @@ CREATE TABLE outbox (
 );
 
 CREATE INDEX idx_outbox_created_at ON outbox(created_at);
+
+CREATE TABLE tickets (
+    id UUID PRIMARY KEY,
+    workflow_id UUID NOT NULL,
+    seat_ids TEXT[] NOT NULL,
+    amount INT NOT NULL,
+    payment_id VARCHAR(255),
+    customer_name VARCHAR(255),
+    customer_email VARCHAR(255),
+    status VARCHAR(50) NOT NULL DEFAULT 'CONFIRMED',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE,
+    CONSTRAINT uq_tickets_workflow_id UNIQUE (workflow_id)
+);
+
+CREATE INDEX idx_tickets_workflow_id ON tickets(workflow_id);

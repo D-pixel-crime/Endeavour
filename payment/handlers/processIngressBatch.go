@@ -27,17 +27,29 @@ type PaymentIngressPayload struct {
 	CustomerDetails *CustomerDetails `json:"customer_details,omitempty"`
 }
 
-func deleteFromIngress(ctx context.Context, msg *consumer.Message) {
-	if shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
+func deleteBatchFromIngress(ctx context.Context, messages []*consumer.Message) {
+	if len(messages) == 0 || shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
 		return
 	}
-	if err := consumer.DeleteMessage(ctx, shared.IngressSQSClient, shared.IngressQueueURL, msg.ReceiptHandle); err != nil {
-		log.Printf("Failed to delete SQS message %s: %v", msg.ID, err)
+
+	for i := 0; i < len(messages); i += 10 {
+		end := min(i+10, len(messages))
+		chunk := messages[i:end]
+
+		result, err := consumer.DeleteMessageBatch(ctx, shared.IngressSQSClient, shared.IngressQueueURL, chunk)
+		if err != nil {
+			log.Printf("Failed to batch delete payment ingress SQS messages: %v", err)
+			continue
+		}
+
+		if len(result.Failed) > 0 {
+			for _, f := range result.Failed {
+				log.Printf("Failed to delete payment ingress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
+			}
+		}
 	}
 }
 
-// ProcessPaymentIngressMessage handles a single message from the payment ingress queue.
-// It returns (shouldDelete, error). If shouldDelete is true, the message can be removed from SQS.
 func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
 		return false, fmt.Errorf("nil message received")
@@ -66,7 +78,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		return false, fmt.Errorf("invalid workflow ID '%s' in message (id=%s): %w", ingressPayload.WorkflowID, msg.ID, err)
 	}
 
-	// Extract payment method from payload root or customer details
 	paymentMethod := ingressPayload.PaymentMethod
 	if paymentMethod == "" && ingressPayload.CustomerDetails != nil {
 		paymentMethod = ingressPayload.CustomerDetails.PaymentMethod
@@ -75,7 +86,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		paymentMethod = "DEFAULT"
 	}
 
-	// Calculate amount if missing (default: numSeats * 500)
 	amount := ingressPayload.Amount
 	if amount <= 0 {
 		numSeats := ingressPayload.NumSeats
@@ -97,7 +107,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 	defer tx.Rollback(ctx)
 
-	// Idempotency check: if workflow already completed, skip duplicate payment processing
 	var existingState string
 	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
 	if err == nil {
@@ -107,7 +116,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		}
 	}
 
-	// Log that the payment is being done
 	log.Printf("[PAYMENT PROCESSING] Initiating payment for workflow %s: amount=%d, method=%s", workflowUUID, amount, paymentMethod)
 	if ingressPayload.CustomerDetails != nil {
 		log.Printf("[PAYMENT PROCESSING] Customer details: email=%s, full_name=%s",
@@ -119,7 +127,11 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	paymentID := uuid.New()
 	_, err = tx.Exec(ctx,
 		`INSERT INTO payments (id, workflow_id, amount, payment_method, status, created_at)
-		 VALUES ($1, $2, $3, $4, 'COMPLETED', NOW())`,
+		 VALUES ($1, $2, $3, $4, 'COMPLETED', NOW())
+		 ON CONFLICT (workflow_id) DO UPDATE
+		   SET amount = EXCLUDED.amount,
+		       payment_method = EXCLUDED.payment_method,
+		       status = EXCLUDED.status`,
 		paymentID, workflowUUID, amount, paymentMethod,
 	)
 	if err != nil {
@@ -139,7 +151,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		return false, fmt.Errorf("failed to upsert workflow: %w", err)
 	}
 
-	// Create outbox message for CDC poller to push to SQS
 	outboxID := uuid.New()
 	outboxPayload := map[string]any{
 		"workflow_id":    workflowUUID.String(),
@@ -173,8 +184,9 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	return true, nil
 }
 
-// ProcessIngressBatch processes a batch of messages from the payment ingress SQS queue.
 func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
+	var toDelete []*consumer.Message
+
 	for _, msg := range messages {
 		if msg == nil {
 			continue
@@ -187,7 +199,11 @@ func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
 		}
 
 		if shouldDelete {
-			deleteFromIngress(ctx, msg)
+			toDelete = append(toDelete, msg)
 		}
+	}
+
+	if len(toDelete) > 0 {
+		deleteBatchFromIngress(ctx, toDelete)
 	}
 }

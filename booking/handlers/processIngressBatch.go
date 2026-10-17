@@ -16,17 +16,29 @@ type BookingIngressPayload struct {
 	NumSeats   int    `json:"num_seats"`
 }
 
-func deleteFromIngress(ctx context.Context, msg *consumer.Message) {
-	if shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
+func deleteBatchFromIngress(ctx context.Context, messages []*consumer.Message) {
+	if len(messages) == 0 || shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
 		return
 	}
-	if err := consumer.DeleteMessage(ctx, shared.IngressSQSClient, shared.IngressQueueURL, msg.ReceiptHandle); err != nil {
-		log.Printf("Failed to delete SQS message %s: %v", msg.ID, err)
+
+	for i := 0; i < len(messages); i += 10 {
+		end := min(i+10, len(messages))
+		chunk := messages[i:end]
+
+		result, err := consumer.DeleteMessageBatch(ctx, shared.IngressSQSClient, shared.IngressQueueURL, chunk)
+		if err != nil {
+			log.Printf("Failed to batch delete booking ingress SQS messages: %v", err)
+			continue
+		}
+
+		if len(result.Failed) > 0 {
+			for _, f := range result.Failed {
+				log.Printf("Failed to delete booking ingress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
+			}
+		}
 	}
 }
 
-// ProcessBookingIngressMessage handles a single message from the booking ingress queue.
-// It returns (shouldDelete, error). If shouldDelete is true, the message can be removed from SQS.
 func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
 		return false, fmt.Errorf("nil message received")
@@ -76,7 +88,6 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 	defer tx.Rollback(ctx)
 
-	// Idempotency check: if workflow already completed, do not reserve seats again
 	var existingState string
 	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
 	if err == nil {
@@ -86,7 +97,6 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		}
 	}
 
-	// Query available seats with FOR UPDATE SKIP LOCKED
 	rows, err := tx.Query(ctx,
 		`SELECT id FROM seat
 		 WHERE is_booked = false
@@ -156,7 +166,6 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		return false, fmt.Errorf("failed to upsert workflow: %w", err)
 	}
 
-	// Create outbox message for CDC poller to push to SQS
 	outboxID := uuid.New()
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
@@ -181,8 +190,9 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	return true, nil
 }
 
-// ProcessIngressBatch processes a batch of messages from the booking ingress SQS queue.
 func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
+	var toDelete []*consumer.Message
+
 	for _, msg := range messages {
 		if msg == nil {
 			continue
@@ -195,7 +205,11 @@ func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
 		}
 
 		if shouldDelete {
-			deleteFromIngress(ctx, msg)
+			toDelete = append(toDelete, msg)
 		}
+	}
+
+	if len(toDelete) > 0 {
+		deleteBatchFromIngress(ctx, toDelete)
 	}
 }
