@@ -5,44 +5,97 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/producer"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Poller struct {
-	dbPool    *pgxpool.Pool
-	sqsClient *sqs.Client
-	router    *Router
-	interval  time.Duration
-	batchSize int
+	dbPool         *pgxpool.Pool
+	producer       *producer.Producer
+	router         *Router
+	interval       time.Duration
+	batchSize      int
+	maxConcurrency int
+	checkColOnce   sync.Once
+	hasTimeoutCol  bool
 }
 
-func NewPoller(dbPool *pgxpool.Pool, sqsClient *sqs.Client, router *Router, interval time.Duration, batchSize int) *Poller {
-	return &Poller{
-		dbPool:    dbPool,
-		sqsClient: sqsClient,
-		router:    router,
-		interval:  interval,
-		batchSize: batchSize,
+func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, interval time.Duration, batchSize int, maxConcurrency ...int) *Poller {
+	limit := 5
+	if len(maxConcurrency) > 0 && maxConcurrency[0] > 0 {
+		limit = maxConcurrency[0]
 	}
+	return &Poller{
+		dbPool:         dbPool,
+		producer:       prod,
+		router:         router,
+		interval:       interval,
+		batchSize:      batchSize,
+		maxConcurrency: limit,
+	}
+}
+
+func (p *Poller) checkTimeoutColumn(ctx context.Context) {
+	p.checkColOnce.Do(func() {
+		var exists bool
+		err := p.dbPool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns 
+				WHERE table_name = 'outbox' AND column_name = 'timeout_seconds'
+			)
+		`).Scan(&exists)
+		if err == nil {
+			p.hasTimeoutCol = exists
+			if exists {
+				log.Println("CDC Poller detected 'timeout_seconds' column in outbox table")
+			} else {
+				log.Println("CDC Poller: 'timeout_seconds' column not detected in outbox table, using fallback")
+			}
+		} else {
+			log.Printf("Warning: failed to check for timeout_seconds column in outbox: %v", err)
+		}
+	})
 }
 
 func (p *Poller) Start(ctx context.Context) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 
-	log.Printf("CDC Poller started (interval: %v, batch size: %d)", p.interval, p.batchSize)
+	sem := make(chan struct{}, p.maxConcurrency)
+	var workerWg sync.WaitGroup
+
+	log.Printf("CDC Poller started (interval: %v, batch size: %d, maxConcurrency: %d)", p.interval, p.batchSize, p.maxConcurrency)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("CDC Poller is stopping...")
+			log.Println("CDC Poller is stopping, waiting for in-flight tasks...")
+			workerWg.Wait()
+			log.Println("CDC Poller stopped cleanly")
 			return
 		case <-ticker.C:
-			go p.processBatch(ctx)
+			select {
+			case sem <- struct{}{}:
+			default:
+				// Concurrency limit reached; skip this tick
+				continue
+			}
+
+			workerWg.Add(1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("Recovered from panic in CDC poller worker: %v", r)
+					}
+					<-sem
+					workerWg.Done()
+				}()
+				p.processBatch(ctx)
+			}()
 		}
 	}
 }
@@ -50,6 +103,54 @@ func (p *Poller) Start(ctx context.Context) {
 type queuedItem struct {
 	outboxID string
 	msg      *producer.Message
+}
+
+// PrepareMessagePayload enriches and validates the outbox payload, ensuring
+// created_at and timeout_parameter/timeout_seconds are always attached to the workflow task.
+func PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.Time, error) {
+	var payloadMap map[string]any
+	if len(msg.Payload) > 0 {
+		if err := json.Unmarshal(msg.Payload, &payloadMap); err != nil {
+			return nil, time.Time{}, fmt.Errorf("failed to unmarshal payload: %w", err)
+		}
+	}
+	if payloadMap == nil {
+		payloadMap = make(map[string]any)
+	}
+
+	if _, ok := payloadMap["workflow_id"]; !ok && msg.WorkflowID != uuid.Nil {
+		payloadMap["workflow_id"] = msg.WorkflowID.String()
+	}
+
+	// Ensure created_at is present in the task payload
+	createdAtStr := msg.CreatedAt.UTC().Format(time.RFC3339)
+	if msg.CreatedAt.IsZero() {
+		createdAtStr = time.Now().UTC().Format(time.RFC3339)
+	}
+	if _, ok := payloadMap["created_at"]; !ok {
+		payloadMap["created_at"] = createdAtStr
+	}
+
+	// Ensure timeout_parameter and timeout_seconds are present in the task payload
+	timeoutSec := msg.TimeoutSeconds
+	if timeoutSec <= 0 {
+		if tp, ok := payloadMap["timeout_parameter"].(float64); ok && tp > 0 {
+			timeoutSec = int(tp)
+		} else if ts, ok := payloadMap["timeout_seconds"].(float64); ok && ts > 0 {
+			timeoutSec = int(ts)
+		} else {
+			timeoutSec = 15 // default timeout parameter in seconds
+		}
+	}
+	payloadMap["timeout_parameter"] = timeoutSec
+	payloadMap["timeout_seconds"] = timeoutSec
+
+	msgTimestamp := msg.CreatedAt.UTC()
+	if msgTimestamp.IsZero() {
+		msgTimestamp = time.Now().UTC()
+	}
+
+	return payloadMap, msgTimestamp, nil
 }
 
 func (p *Poller) processBatch(ctx context.Context) {
@@ -60,7 +161,15 @@ func (p *Poller) processBatch(ctx context.Context) {
 	}
 	defer tx.Rollback(ctx)
 
-	query := fmt.Sprintf(`SELECT id, workflow_id, worker_type, payload, created_at FROM outbox ORDER BY created_at LIMIT %d FOR UPDATE SKIP LOCKED`, p.batchSize)
+	p.checkTimeoutColumn(ctx)
+
+	var query string
+	if p.hasTimeoutCol {
+		query = fmt.Sprintf(`SELECT id, workflow_id, worker_type, payload, timeout_seconds, created_at FROM outbox ORDER BY created_at LIMIT %d FOR UPDATE SKIP LOCKED`, p.batchSize)
+	} else {
+		query = fmt.Sprintf(`SELECT id, workflow_id, worker_type, payload, created_at FROM outbox ORDER BY created_at LIMIT %d FOR UPDATE SKIP LOCKED`, p.batchSize)
+	}
+
 	rows, err := tx.Query(ctx, query)
 	if err != nil {
 		log.Printf("Failed to query outbox: %v", err)
@@ -71,9 +180,16 @@ func (p *Poller) processBatch(ctx context.Context) {
 	var messages []OutboxMessage
 	for rows.Next() {
 		var msg OutboxMessage
-		if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.CreatedAt); err != nil {
-			log.Printf("Failed to scan outbox message: %v", err)
-			continue
+		if p.hasTimeoutCol {
+			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.TimeoutSeconds, &msg.CreatedAt); err != nil {
+				log.Printf("Failed to scan outbox message: %v", err)
+				continue
+			}
+		} else {
+			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.CreatedAt); err != nil {
+				log.Printf("Failed to scan outbox message: %v", err)
+				continue
+			}
 		}
 		messages = append(messages, msg)
 	}
@@ -94,21 +210,20 @@ func (p *Poller) processBatch(ctx context.Context) {
 			continue
 		}
 
-		var payloadMap map[string]any
-		if len(msg.Payload) > 0 {
-			if err := json.Unmarshal(msg.Payload, &payloadMap); err != nil {
-				log.Printf("Failed to unmarshal payload for message %s: %v", msg.ID, err)
-				failedIDs[msg.ID.String()] = true
-				continue
-			}
+		payloadMap, msgTimestamp, err := PrepareMessagePayload(msg)
+		if err != nil {
+			log.Printf("Failed to prepare payload for message %s: %v", msg.ID, err)
+			failedIDs[msg.ID.String()] = true
+			continue
 		}
 
 		batchesByQueue[queueURL] = append(batchesByQueue[queueURL], &queuedItem{
 			outboxID: msg.ID.String(),
 			msg: &producer.Message{
-				ID:      msg.ID.String(),
-				Type:    msg.WorkerType,
-				Payload: payloadMap,
+				ID:        msg.ID.String(),
+				Type:      msg.WorkerType,
+				Payload:   payloadMap,
+				Timestamp: msgTimestamp,
 			},
 		})
 	}
@@ -119,7 +234,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 			producerMessages[i] = item.msg
 		}
 
-		res, err := producer.SendBatchMessage(ctx, p.sqsClient, queueURL, producerMessages)
+		res, err := p.producer.SendBatch(ctx, queueURL, producerMessages)
 		if err != nil {
 			log.Printf("Failed to push batch of %d messages to SQS queue %s: %v", len(batch), queueURL, err)
 			for _, item := range batch {

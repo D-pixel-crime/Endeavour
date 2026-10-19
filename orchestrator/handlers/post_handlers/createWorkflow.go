@@ -19,7 +19,6 @@ type customerDetails struct {
 type reqBody struct {
 	WorkflowID      uuid.UUID                `json:"workflow_id"`
 	WorkflowType    shared_vars.WorkflowType `json:"workflow_type"`
-	PaymentMethod   string                   `json:"payment_method,omitempty"`
 	CustomerDetails customerDetails          `json:"customer_details"`
 }
 
@@ -33,20 +32,9 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	if req.CustomerDetails.PaymentMethod == "" && req.PaymentMethod != "" {
-		req.CustomerDetails.PaymentMethod = req.PaymentMethod
-	}
-
 	if req.WorkflowID == uuid.Nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "No Workflow ID",
-		})
-		return
-	}
-
-	if req.WorkflowType != shared_vars.WORKFLOW_TYPE_TICKET_BOOKING {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Invalid Workflow Type",
 		})
 		return
 	}
@@ -55,6 +43,20 @@ func CreateWorkflow(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Failed to marshal customer_details",
+		})
+		return
+	}
+
+	if req.CustomerDetails.PaymentMethod == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "No Payment Method",
+		})
+		return
+	}
+
+	if req.WorkflowType != shared_vars.WORKFLOW_TYPE_TICKET_BOOKING {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid Workflow Type",
 		})
 		return
 	}
@@ -76,6 +78,21 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback(ctx)
+
+	var checkWorkflowExists string = `SELECT id FROM workflows WHERE id = $1`
+	var workflow_id uuid.UUID
+	if err = shared_vars.Orchestrator_DB_Pool.QueryRow(ctx, checkWorkflowExists, req.WorkflowID).Scan(&workflow_id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to assess existence of Workflow!",
+		})
+		return
+	}
+	if workflow_id != uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Workflow Already Exists",
+		})
+		return
+	}
 
 	var workflowInsert string = `INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '20 seconds') RETURNING id`
 	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_INITIALIZED, customerDetails)

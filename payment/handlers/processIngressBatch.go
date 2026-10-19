@@ -19,35 +19,19 @@ type CustomerDetails struct {
 }
 
 type PaymentIngressPayload struct {
-	WorkflowID      string           `json:"workflow_id"`
-	Amount          int              `json:"amount"`
-	NumSeats        int              `json:"num_seats"`
-	SeatIDs         []string         `json:"seat_ids"`
-	PaymentMethod   string           `json:"payment_method"`
-	CustomerDetails *CustomerDetails `json:"customer_details,omitempty"`
+	WorkflowID       string           `json:"workflow_id"`
+	Amount           int              `json:"amount"`
+	NumSeats         int              `json:"num_seats"`
+	SeatIDs          []string         `json:"seat_ids"`
+	PaymentMethod    string           `json:"payment_method"`
+	CustomerDetails  *CustomerDetails `json:"customer_details,omitempty"`
+	CreatedAt        string           `json:"created_at,omitempty"`
+	TimeoutParameter int              `json:"timeout_parameter,omitempty"`
+	TimeoutSeconds   int              `json:"timeout_seconds,omitempty"`
 }
 
 func deleteBatchFromIngress(ctx context.Context, messages []*consumer.Message) {
-	if len(messages) == 0 || shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
-		return
-	}
-
-	for i := 0; i < len(messages); i += 10 {
-		end := min(i+10, len(messages))
-		chunk := messages[i:end]
-
-		result, err := consumer.DeleteMessageBatch(ctx, shared.IngressSQSClient, shared.IngressQueueURL, chunk)
-		if err != nil {
-			log.Printf("Failed to batch delete payment ingress SQS messages: %v", err)
-			continue
-		}
-
-		if len(result.Failed) > 0 {
-			for _, f := range result.Failed {
-				log.Printf("Failed to delete payment ingress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
-			}
-		}
-	}
+	consumer.DeleteAllBatches(ctx, shared.IngressSQSClient, shared.IngressQueueURL, messages)
 }
 
 func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
@@ -152,14 +136,23 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 
 	outboxID := uuid.New()
+	timeoutParam := ingressPayload.TimeoutParameter
+	if timeoutParam <= 0 {
+		timeoutParam = ingressPayload.TimeoutSeconds
+	}
+	if timeoutParam <= 0 {
+		timeoutParam = 15
+	}
 	outboxPayload := map[string]any{
-		"workflow_id":    workflowUUID.String(),
-		"status":         "COMPLETED",
-		"amount":         amount,
-		"payment_method": paymentMethod,
-		"payment_id":     paymentID.String(),
-		"seat_ids":       ingressPayload.SeatIDs,
-		"num_seats":      ingressPayload.NumSeats,
+		"workflow_id":       workflowUUID.String(),
+		"status":            "COMPLETED",
+		"amount":            amount,
+		"payment_method":    paymentMethod,
+		"payment_id":        paymentID.String(),
+		"seat_ids":          ingressPayload.SeatIDs,
+		"num_seats":         ingressPayload.NumSeats,
+		"timeout_parameter": timeoutParam,
+		"timeout_seconds":   timeoutParam,
 	}
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {

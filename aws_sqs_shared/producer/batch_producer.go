@@ -23,26 +23,13 @@ type BatchSendError struct {
 	Message   string
 }
 
-func SendBatchMessage(
+func (producer *Producer) sendSingleBatch(
 	ctx context.Context,
-	client *sqs.Client,
 	queueURL string,
-	messages []*Message,
-) (*BatchSendResult, error) {
-	p := NewProducer(client, queueURL)
-	return p.SendBatchMessage(ctx, messages)
-}
-
-func (producer *Producer) SendBatchMessage(
-	ctx context.Context,
 	messages []*Message,
 ) (*BatchSendResult, error) {
 	if len(messages) == 0 {
 		return &BatchSendResult{}, nil
-	}
-
-	if len(messages) > 10 {
-		return nil, fmt.Errorf("Exceeded limit of AWS SQS Batch send of 10 messages")
 	}
 
 	entries := make([]types.SendMessageBatchRequestEntry, len(messages))
@@ -51,7 +38,9 @@ func (producer *Producer) SendBatchMessage(
 		if msg.ID == "" {
 			msg.ID = uuid.New().String()
 		}
-		msg.Timestamp = time.Now().UTC()
+		if msg.Timestamp.IsZero() {
+			msg.Timestamp = time.Now().UTC()
+		}
 
 		body, err := json.Marshal(msg)
 		if err != nil {
@@ -66,13 +55,17 @@ func (producer *Producer) SendBatchMessage(
 					DataType:    aws.String("String"),
 					StringValue: aws.String(msg.Type),
 				},
+				"CorrelationId": {
+					DataType:    aws.String("String"),
+					StringValue: aws.String(msg.ID),
+				},
 			},
 		}
 
 	}
 
 	input := &sqs.SendMessageBatchInput{
-		QueueUrl: aws.String(producer.queueURL),
+		QueueUrl: aws.String(queueURL),
 		Entries:  entries,
 	}
 
@@ -99,4 +92,39 @@ func (producer *Producer) SendBatchMessage(
 	}
 
 	return batchRes, nil
+}
+
+func (producer *Producer) SendBatch(
+	ctx context.Context,
+	queueURL string,
+	messages []*Message,
+) (*BatchSendResult, error) {
+	if len(messages) == 0 {
+		return &BatchSendResult{}, nil
+	}
+
+	targetURL := queueURL
+	if targetURL == "" {
+		targetURL = producer.queueURL
+	}
+	if targetURL == "" {
+		return nil, fmt.Errorf("queue URL cannot be empty")
+	}
+
+	aggregated := &BatchSendResult{}
+
+	for i := 0; i < len(messages); i += 10 {
+		end := min(i+10, len(messages))
+		chunk := messages[i:end]
+
+		res, err := producer.sendSingleBatch(ctx, targetURL, chunk)
+		if err != nil {
+			return aggregated, err
+		}
+
+		aggregated.Successful = append(aggregated.Successful, res.Successful...)
+		aggregated.Failed = append(aggregated.Failed, res.Failed...)
+	}
+
+	return aggregated, nil
 }

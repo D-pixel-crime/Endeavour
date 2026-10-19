@@ -15,37 +15,21 @@ import (
 )
 
 type PaymentEgressPayload struct {
-	WorkflowID    string   `json:"workflow_id"`
-	Status        string   `json:"status"`
-	Amount        int      `json:"amount"`
-	PaymentMethod string   `json:"payment_method,omitempty"`
-	PaymentID     string   `json:"payment_id,omitempty"`
-	SeatIDs       []string `json:"seat_ids,omitempty"`
-	NumSeats      int      `json:"num_seats,omitempty"`
-	Reason        string   `json:"reason,omitempty"`
+	WorkflowID       string   `json:"workflow_id"`
+	Status           string   `json:"status"`
+	Amount           int      `json:"amount"`
+	PaymentMethod    string   `json:"payment_method,omitempty"`
+	PaymentID        string   `json:"payment_id,omitempty"`
+	SeatIDs          []string `json:"seat_ids,omitempty"`
+	NumSeats         int      `json:"num_seats,omitempty"`
+	Reason           string   `json:"reason,omitempty"`
+	CreatedAt        string   `json:"created_at,omitempty"`
+	TimeoutParameter int      `json:"timeout_parameter,omitempty"`
+	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
 }
 
 func deleteBatchFromPaymentEgress(ctx context.Context, messages []*consumer.Message) {
-	if len(messages) == 0 || shared_vars.PaymentEgressSQSClient == nil || shared_vars.PaymentEgressQueueURL == "" {
-		return
-	}
-
-	for i := 0; i < len(messages); i += 10 {
-		end := min(i+10, len(messages))
-		chunk := messages[i:end]
-
-		result, err := consumer.DeleteMessageBatch(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, chunk)
-		if err != nil {
-			log.Printf("Failed to batch delete payment egress SQS messages: %v", err)
-			continue
-		}
-
-		if len(result.Failed) > 0 {
-			for _, f := range result.Failed {
-				log.Printf("Failed to delete payment egress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
-			}
-		}
-	}
+	consumer.DeleteAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, messages)
 }
 
 func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {

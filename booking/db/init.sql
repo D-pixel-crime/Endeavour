@@ -24,6 +24,7 @@ CREATE TABLE outbox (
     workflow_id UUID NOT NULL,
     worker_type worker_type NOT NULL,
     payload JSONB NOT NULL,
+    timeout_seconds INT NOT NULL DEFAULT 15,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE
 );

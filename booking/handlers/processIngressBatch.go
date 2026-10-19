@@ -12,31 +12,15 @@ import (
 )
 
 type BookingIngressPayload struct {
-	WorkflowID string `json:"workflow_id"`
-	NumSeats   int    `json:"num_seats"`
+	WorkflowID       string `json:"workflow_id"`
+	NumSeats         int    `json:"num_seats"`
+	CreatedAt        string `json:"created_at,omitempty"`
+	TimeoutParameter int    `json:"timeout_parameter,omitempty"`
+	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
 }
 
 func deleteBatchFromIngress(ctx context.Context, messages []*consumer.Message) {
-	if len(messages) == 0 || shared.IngressSQSClient == nil || shared.IngressQueueURL == "" {
-		return
-	}
-
-	for i := 0; i < len(messages); i += 10 {
-		end := min(i+10, len(messages))
-		chunk := messages[i:end]
-
-		result, err := consumer.DeleteMessageBatch(ctx, shared.IngressSQSClient, shared.IngressQueueURL, chunk)
-		if err != nil {
-			log.Printf("Failed to batch delete booking ingress SQS messages: %v", err)
-			continue
-		}
-
-		if len(result.Failed) > 0 {
-			for _, f := range result.Failed {
-				log.Printf("Failed to delete booking ingress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
-			}
-		}
-	}
+	consumer.DeleteAllBatches(ctx, shared.IngressSQSClient, shared.IngressQueueURL, messages)
 }
 
 func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
@@ -123,14 +107,24 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	workflowState := shared.BOOKING_WORKFLOW_COMPLETED
 	var outboxPayload map[string]any
 
+	timeoutParam := ingressPayload.TimeoutParameter
+	if timeoutParam <= 0 {
+		timeoutParam = ingressPayload.TimeoutSeconds
+	}
+	if timeoutParam <= 0 {
+		timeoutParam = 15
+	}
+
 	if len(seatIDs) < ingressPayload.NumSeats {
 		log.Printf("insufficient seats for workflow %s: requested=%d available=%d",
 			workflowUUID, ingressPayload.NumSeats, len(seatIDs))
 		workflowState = shared.BOOKING_WORKFLOW_FAILED
 		outboxPayload = map[string]any{
-			"workflow_id": workflowUUID.String(),
-			"status":      "FAILED",
-			"reason":      fmt.Sprintf("insufficient seats: requested %d, available %d", ingressPayload.NumSeats, len(seatIDs)),
+			"workflow_id":       workflowUUID.String(),
+			"status":            "FAILED",
+			"reason":            fmt.Sprintf("insufficient seats: requested %d, available %d", ingressPayload.NumSeats, len(seatIDs)),
+			"timeout_parameter": timeoutParam,
+			"timeout_seconds":   timeoutParam,
 		}
 	} else {
 		seatIDStrings := make([]string, len(seatIDs))
@@ -147,10 +141,12 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		}
 
 		outboxPayload = map[string]any{
-			"workflow_id": workflowUUID.String(),
-			"status":      "COMPLETED",
-			"seat_ids":    seatIDStrings,
-			"num_seats":   ingressPayload.NumSeats,
+			"workflow_id":       workflowUUID.String(),
+			"status":            "COMPLETED",
+			"seat_ids":          seatIDStrings,
+			"num_seats":         ingressPayload.NumSeats,
+			"timeout_parameter": timeoutParam,
+			"timeout_seconds":   timeoutParam,
 		}
 	}
 

@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/producer"
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -42,8 +43,9 @@ func main() {
 		log.Fatalf("Failed to create SQS client: %v", err)
 	}
 
+	sqsProducer := producer.NewProducer(sqsClient, cfg.TargetQueueURL)
 	router := NewRouter(cfg)
-	poller := NewPoller(dbPool, sqsClient, router, cfg.PollInterval, cfg.BatchSize)
+	poller := NewPoller(dbPool, sqsProducer, router, cfg.PollInterval, cfg.BatchSize)
 	server := NewServer(cfg.HTTPPort, sqsClient, router)
 
 	server.Start()

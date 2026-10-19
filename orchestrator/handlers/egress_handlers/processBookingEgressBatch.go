@@ -14,34 +14,18 @@ import (
 )
 
 type BookingEgressPayload struct {
-	WorkflowID string   `json:"workflow_id"`
-	Status     string   `json:"status"`
-	SeatIDs    []string `json:"seat_ids"`
-	NumSeats   int      `json:"num_seats"`
-	Reason     string   `json:"reason,omitempty"`
+	WorkflowID       string   `json:"workflow_id"`
+	Status           string   `json:"status"`
+	SeatIDs          []string `json:"seat_ids"`
+	NumSeats         int      `json:"num_seats"`
+	Reason           string   `json:"reason,omitempty"`
+	CreatedAt        string   `json:"created_at,omitempty"`
+	TimeoutParameter int      `json:"timeout_parameter,omitempty"`
+	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
 }
 
 func deleteBatchFromBookingEgress(ctx context.Context, messages []*consumer.Message) {
-	if len(messages) == 0 || shared_vars.BookingEgressSQSClient == nil || shared_vars.BookingEgressQueueURL == "" {
-		return
-	}
-
-	for i := 0; i < len(messages); i += 10 {
-		end := min(i+10, len(messages))
-		chunk := messages[i:end]
-
-		result, err := consumer.DeleteMessageBatch(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, chunk)
-		if err != nil {
-			log.Printf("Failed to batch delete booking egress SQS messages: %v", err)
-			continue
-		}
-
-		if len(result.Failed) > 0 {
-			for _, f := range result.Failed {
-				log.Printf("Failed to delete booking egress SQS message (id=%s, code=%s): %s", f.ID, f.Code, f.Message)
-			}
-		}
-	}
+	consumer.DeleteAllBatches(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, messages)
 }
 
 func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
