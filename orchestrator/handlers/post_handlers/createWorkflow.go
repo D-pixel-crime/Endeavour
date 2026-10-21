@@ -2,6 +2,7 @@ package posthandlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
@@ -94,8 +95,14 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	var workflowInsert string = `INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '20 seconds') RETURNING id`
-	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_INITIALIZED, customerDetails)
+	bookingTimeout := shared_vars.BookingTaskTimeoutSeconds
+	if bookingTimeout <= 0 {
+		bookingTimeout = 15
+	}
+	stateTimeoutSec := bookingTimeout + 5
+
+	var workflowInsert string = fmt.Sprintf(`INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '%d seconds') RETURNING id`, stateTimeoutSec)
+	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING, customerDetails)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert workflow",
@@ -103,8 +110,8 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, 15, NOW())`
-	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails)
+	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails, bookingTimeout)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert outbox",

@@ -18,15 +18,16 @@ const (
 )
 
 type Config struct {
-	ServiceName  string
-	Mode         Mode
-	DatabaseURL  string
-	PollInterval time.Duration
-	BatchSize    int
-	HTTPPort     string
+	ServiceName       string
+	Mode              Mode
+	DatabaseURL       string
+	PollInterval      time.Duration
+	BatchSize         int
+	HTTPPort          string
+	VisibilityTimeout int
 
 	TargetQueueURL string
-	TargetQueues map[string]string
+	TargetQueues   map[string]string
 }
 
 func LoadConfig() (*Config, error) {
@@ -99,10 +100,22 @@ func LoadConfig() (*Config, error) {
 		port = os.Getenv("CDC_ORCHESTRATOR_PORT")
 	}
 	if port == "" {
-		port = os.Getenv("CDC_ORCHESTRATOR_PORT")
-	}
-	if port == "" {
 		port = "8080"
+	}
+
+	visTimeoutStr := os.Getenv("CDC_VISIBILITY_TIMEOUT_SECONDS")
+	if visTimeoutStr == "" {
+		visTimeoutStr = os.Getenv("VISIBILITY_TIMEOUT_SECONDS")
+	}
+	if visTimeoutStr == "" {
+		visTimeoutStr = os.Getenv("CDC_TASK_TIMEOUT_SECONDS")
+	}
+	if visTimeoutStr == "" {
+		return nil, fmt.Errorf("CDC_VISIBILITY_TIMEOUT_SECONDS is not set")
+	}
+	visTimeoutSec, err := strconv.Atoi(visTimeoutStr)
+	if err != nil || visTimeoutSec <= 0 {
+		return nil, fmt.Errorf("invalid CDC_VISIBILITY_TIMEOUT_SECONDS '%s': must be a positive integer", visTimeoutStr)
 	}
 
 	targetQueues := make(map[string]string)
@@ -178,20 +191,29 @@ func LoadConfig() (*Config, error) {
 		if singleQueueURL == "" {
 			return nil, fmt.Errorf("TARGET_SQS_URL is required for SINGLE mode")
 		}
+		if !strings.Contains(singleQueueURL, ".fifo") {
+			return nil, fmt.Errorf("TARGET_SQS_URL '%s' must be a FIFO queue (must contain .fifo)", singleQueueURL)
+		}
 	} else {
 		if len(targetQueues) == 0 {
 			return nil, fmt.Errorf("TARGET_QUEUES (or individual TARGET_QUEUE_<WORKER>) is required for MULTI mode")
 		}
+		for worker, qURL := range targetQueues {
+			if !strings.Contains(qURL, ".fifo") {
+				log.Printf("Warning: target queue for worker %s '%s' is not a FIFO queue (must contain .fifo); messages destined for this queue will not be processed", worker, qURL)
+			}
+		}
 	}
 
 	return &Config{
-		ServiceName:    serviceName,
-		Mode:           mode,
-		DatabaseURL:    dbURL,
-		PollInterval:   time.Duration(intervalSec) * time.Second,
-		BatchSize:      batchSize,
-		HTTPPort:       port,
-		TargetQueueURL: singleQueueURL,
-		TargetQueues:   targetQueues,
+		ServiceName:       serviceName,
+		Mode:              mode,
+		DatabaseURL:       dbURL,
+		PollInterval:      time.Duration(intervalSec) * time.Second,
+		BatchSize:         batchSize,
+		HTTPPort:          port,
+		VisibilityTimeout: visTimeoutSec,
+		TargetQueueURL:    singleQueueURL,
+		TargetQueues:      targetQueues,
 	}, nil
 }

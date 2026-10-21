@@ -45,7 +45,7 @@ func main() {
 
 	sqsProducer := producer.NewProducer(sqsClient, cfg.TargetQueueURL)
 	router := NewRouter(cfg)
-	poller := NewPoller(dbPool, sqsProducer, router, cfg.PollInterval, cfg.BatchSize)
+	poller := NewPoller(dbPool, sqsProducer, router, cfg.PollInterval, cfg.BatchSize, cfg.VisibilityTimeout)
 	server := NewServer(cfg.HTTPPort, sqsClient, router)
 
 	server.Start()

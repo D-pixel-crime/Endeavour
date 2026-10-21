@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -47,7 +48,7 @@ func (producer *Producer) sendSingleBatch(
 			return nil, fmt.Errorf("Error Marshalling Message %d: %w", i, err)
 		}
 
-		entries[i] = types.SendMessageBatchRequestEntry{
+		entry := types.SendMessageBatchRequestEntry{
 			Id:          aws.String(msg.ID),
 			MessageBody: aws.String(string(body)),
 			MessageAttributes: map[string]types.MessageAttributeValue{
@@ -62,6 +63,27 @@ func (producer *Producer) sendSingleBatch(
 			},
 		}
 
+		if !strings.Contains(queueURL, ".fifo") {
+			return nil, fmt.Errorf("queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
+		}
+
+		groupID := msg.GroupID
+		if groupID == "" && msg.Payload != nil {
+			if wfID, ok := msg.Payload["workflow_id"].(string); ok && wfID != "" {
+				groupID = wfID
+			}
+		}
+		if groupID == "" {
+			return nil, fmt.Errorf("MessageGroupId (workflow_id) is missing for message %s on FIFO queue %s", msg.ID, queueURL)
+		}
+		entry.MessageGroupId = aws.String(groupID)
+
+		if msg.DeduplicationID == "" {
+			return nil, fmt.Errorf("MessageDeduplicationId is missing for message %s on FIFO queue %s", msg.ID, queueURL)
+		}
+		entry.MessageDeduplicationId = aws.String(msg.DeduplicationID)
+
+		entries[i] = entry
 	}
 
 	input := &sqs.SendMessageBatchInput{
@@ -109,6 +131,9 @@ func (producer *Producer) SendBatch(
 	}
 	if targetURL == "" {
 		return nil, fmt.Errorf("queue URL cannot be empty")
+	}
+	if !strings.Contains(targetURL, ".fifo") {
+		return nil, fmt.Errorf("queue %s must be a FIFO queue (name must end with .fifo)", targetURL)
 	}
 
 	aggregated := &BatchSendResult{}

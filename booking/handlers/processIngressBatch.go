@@ -19,10 +19,6 @@ type BookingIngressPayload struct {
 	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
 }
 
-func deleteBatchFromIngress(ctx context.Context, messages []*consumer.Message) {
-	consumer.DeleteAllBatches(ctx, shared.IngressSQSClient, shared.IngressQueueURL, messages)
-}
-
 func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
 		return false, fmt.Errorf("nil message received")
@@ -42,8 +38,8 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		return false, fmt.Errorf("failed to unmarshal booking ingress payload (id=%s): %w", msg.ID, err)
 	}
 
-	if ingressPayload.WorkflowID == "" && msg.ID != "" {
-		ingressPayload.WorkflowID = msg.ID
+	if ingressPayload.WorkflowID == "" {
+		return false, fmt.Errorf("missing workflow ID in message payload (id=%s)", msg.ID)
 	}
 
 	workflowUUID, err := uuid.Parse(ingressPayload.WorkflowID)
@@ -206,6 +202,6 @@ func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
 	}
 
 	if len(toDelete) > 0 {
-		deleteBatchFromIngress(ctx, toDelete)
+		consumer.DeleteAllBatches(ctx, shared.IngressSQSClient, shared.IngressQueueURL, toDelete)
 	}
 }

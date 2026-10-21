@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,28 +15,30 @@ import (
 )
 
 type Poller struct {
-	dbPool         *pgxpool.Pool
-	producer       *producer.Producer
-	router         *Router
-	interval       time.Duration
-	batchSize      int
-	maxConcurrency int
-	checkColOnce   sync.Once
-	hasTimeoutCol  bool
+	dbPool            *pgxpool.Pool
+	producer          *producer.Producer
+	router            *Router
+	interval          time.Duration
+	batchSize         int
+	maxConcurrency    int
+	visibilityTimeout int
+	checkColOnce      sync.Once
+	hasTimeoutCol     bool
 }
 
-func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, interval time.Duration, batchSize int, maxConcurrency ...int) *Poller {
+func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, interval time.Duration, batchSize int, visibilityTimeout int, maxConcurrency ...int) *Poller {
 	limit := 5
 	if len(maxConcurrency) > 0 && maxConcurrency[0] > 0 {
 		limit = maxConcurrency[0]
 	}
 	return &Poller{
-		dbPool:         dbPool,
-		producer:       prod,
-		router:         router,
-		interval:       interval,
-		batchSize:      batchSize,
-		maxConcurrency: limit,
+		dbPool:            dbPool,
+		producer:          prod,
+		router:            router,
+		interval:          interval,
+		batchSize:         batchSize,
+		maxConcurrency:    limit,
+		visibilityTimeout: visibilityTimeout,
 	}
 }
 
@@ -107,7 +110,7 @@ type queuedItem struct {
 
 // PrepareMessagePayload enriches and validates the outbox payload, ensuring
 // created_at and timeout_parameter/timeout_seconds are always attached to the workflow task.
-func PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.Time, error) {
+func (p *Poller) PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.Time, error) {
 	var payloadMap map[string]any
 	if len(msg.Payload) > 0 {
 		if err := json.Unmarshal(msg.Payload, &payloadMap); err != nil {
@@ -138,6 +141,8 @@ func PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.Time, error)
 			timeoutSec = int(tp)
 		} else if ts, ok := payloadMap["timeout_seconds"].(float64); ok && ts > 0 {
 			timeoutSec = int(ts)
+		} else if p.visibilityTimeout > 0 {
+			timeoutSec = p.visibilityTimeout
 		} else {
 			timeoutSec = 15 // default timeout parameter in seconds
 		}
@@ -210,9 +215,27 @@ func (p *Poller) processBatch(ctx context.Context) {
 			continue
 		}
 
-		payloadMap, msgTimestamp, err := PrepareMessagePayload(msg)
+		if !strings.Contains(queueURL, ".fifo") {
+			log.Printf("Skipping message %s (worker_type: %s): target queue '%s' is not a FIFO queue (must contain .fifo)", msg.ID, msg.WorkerType, queueURL)
+			failedIDs[msg.ID.String()] = true
+			continue
+		}
+
+		payloadMap, msgTimestamp, err := p.PrepareMessagePayload(msg)
 		if err != nil {
 			log.Printf("Failed to prepare payload for message %s: %v", msg.ID, err)
+			failedIDs[msg.ID.String()] = true
+			continue
+		}
+
+		groupID := ""
+		if msg.WorkflowID != uuid.Nil {
+			groupID = msg.WorkflowID.String()
+		} else if wfID, ok := payloadMap["workflow_id"].(string); ok && wfID != "" {
+			groupID = wfID
+		}
+		if groupID == "" {
+			log.Printf("Grave error: message %s (worker_type: %s) has no workflow_id; cannot determine MessageGroupId", msg.ID, msg.WorkerType)
 			failedIDs[msg.ID.String()] = true
 			continue
 		}
@@ -220,10 +243,12 @@ func (p *Poller) processBatch(ctx context.Context) {
 		batchesByQueue[queueURL] = append(batchesByQueue[queueURL], &queuedItem{
 			outboxID: msg.ID.String(),
 			msg: &producer.Message{
-				ID:        msg.ID.String(),
-				Type:      msg.WorkerType,
-				Payload:   payloadMap,
-				Timestamp: msgTimestamp,
+				ID:              msg.ID.String(),
+				Type:            msg.WorkerType,
+				Payload:         payloadMap,
+				Timestamp:       msgTimestamp,
+				GroupID:         groupID,
+				DeduplicationID: msg.ID.String(),
 			},
 		})
 	}

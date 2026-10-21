@@ -11,13 +11,13 @@ func PullBatchFromBookingEgressSQS(ctx context.Context) ([]*consumer.Message, er
 	if shared_vars.BookingEgressSQSClient == nil || shared_vars.BookingEgressQueueURL == "" {
 		return nil, nil
 	}
-	return consumer.ReceiveBatch(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, 10)
+	return consumer.ReceiveMessages(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, 10, 0, shared_vars.BookingEgressVisibilityTimeout)
 }
 
 func PullBatchFromPaymentEgressSQS(ctx context.Context) ([]*consumer.Message, error) {
 	if shared_vars.PaymentEgressSQSClient == nil || shared_vars.PaymentEgressQueueURL == "" {
 		return nil, nil
 	}
-	return consumer.ReceiveBatch(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, 10)
+	return consumer.ReceiveMessages(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, 10, 0, shared_vars.PaymentEgressVisibilityTimeout)
 }
 

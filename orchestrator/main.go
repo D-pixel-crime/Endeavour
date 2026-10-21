@@ -54,6 +54,30 @@ func main() {
 
 	shared_vars.BookingEgressQueueURL = os.Getenv("BOOKING_EGRESS_SQS_URL")
 	if shared_vars.BookingEgressQueueURL != "" {
+		if !strings.Contains(shared_vars.BookingEgressQueueURL, ".fifo") {
+			log.Fatalf("BOOKING_EGRESS_SQS_URL '%s' must be a FIFO queue (must contain .fifo)", shared_vars.BookingEgressQueueURL)
+		}
+		visTimeoutStr := os.Getenv("BOOKING_EGRESS_VISIBILITY_TIMEOUT_SECONDS")
+		if visTimeoutStr == "" {
+			visTimeoutStr = os.Getenv("ORCHESTRATOR_VISIBILITY_TIMEOUT_SECONDS")
+		}
+		if visTimeoutStr == "" {
+			log.Fatalf("BOOKING_EGRESS_VISIBILITY_TIMEOUT_SECONDS is not set")
+		}
+		sec, err := strconv.Atoi(visTimeoutStr)
+		if err != nil || sec <= 0 {
+			log.Fatalf("Invalid BOOKING_EGRESS_VISIBILITY_TIMEOUT_SECONDS: %v", err)
+		}
+		shared_vars.BookingEgressVisibilityTimeout = int32(sec)
+
+		bookingTaskTimeout := sec
+		if s := os.Getenv("BOOKING_TASK_TIMEOUT_SECONDS"); s != "" {
+			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
+				bookingTaskTimeout = parsed
+			}
+		}
+		shared_vars.BookingTaskTimeoutSeconds = bookingTaskTimeout
+
 		shared_vars.BookingEgressSQSClient, err = sqs_config.NewDefaultSQSClient(ctx)
 		if err != nil {
 			log.Fatalf("Failed to create Booking Egress SQS client: %v", err)
@@ -68,6 +92,30 @@ func main() {
 
 	shared_vars.PaymentEgressQueueURL = os.Getenv("PAYMENT_EGRESS_SQS_URL")
 	if shared_vars.PaymentEgressQueueURL != "" {
+		if !strings.Contains(shared_vars.PaymentEgressQueueURL, ".fifo") {
+			log.Fatalf("PAYMENT_EGRESS_SQS_URL '%s' must be a FIFO queue (must contain .fifo)", shared_vars.PaymentEgressQueueURL)
+		}
+		visTimeoutStr := os.Getenv("PAYMENT_EGRESS_VISIBILITY_TIMEOUT_SECONDS")
+		if visTimeoutStr == "" {
+			visTimeoutStr = os.Getenv("ORCHESTRATOR_VISIBILITY_TIMEOUT_SECONDS")
+		}
+		if visTimeoutStr == "" {
+			log.Fatalf("PAYMENT_EGRESS_VISIBILITY_TIMEOUT_SECONDS is not set")
+		}
+		sec, err := strconv.Atoi(visTimeoutStr)
+		if err != nil || sec <= 0 {
+			log.Fatalf("Invalid PAYMENT_EGRESS_VISIBILITY_TIMEOUT_SECONDS: %v", err)
+		}
+		shared_vars.PaymentEgressVisibilityTimeout = int32(sec)
+
+		paymentTaskTimeout := sec
+		if s := os.Getenv("PAYMENT_TASK_TIMEOUT_SECONDS"); s != "" {
+			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
+				paymentTaskTimeout = parsed
+			}
+		}
+		shared_vars.PaymentTaskTimeoutSeconds = paymentTaskTimeout
+
 		shared_vars.PaymentEgressSQSClient, err = sqs_config.NewDefaultSQSClient(ctx)
 		if err != nil {
 			log.Fatalf("Failed to create Payment Egress SQS client: %v", err)

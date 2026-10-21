@@ -28,11 +28,12 @@ func resolveMaxConcurrency(maxConcurrency []int) int {
 func StartPoller(ctx context.Context, interval time.Duration, maxConcurrency ...int) {
 	limit := resolveMaxConcurrency(maxConcurrency)
 	bp := consumer.NewBatchPoller(consumer.PollerConfig{
-		Name:           "Booking Ingress",
-		Client:         shared.IngressSQSClient,
-		QueueURL:       shared.IngressQueueURL,
-		Interval:       interval,
-		MaxConcurrency: limit,
+		Name:              "Booking Ingress",
+		Client:            shared.IngressSQSClient,
+		QueueURL:          shared.IngressQueueURL,
+		Interval:          interval,
+		MaxConcurrency:    limit,
+		VisibilityTimeout: shared.IngressVisibilityTimeout,
 	}, handlers.ProcessIngressBatch)
 	bp.Start(ctx)
 }

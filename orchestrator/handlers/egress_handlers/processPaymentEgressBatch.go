@@ -28,10 +28,6 @@ type PaymentEgressPayload struct {
 	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
 }
 
-func deleteBatchFromPaymentEgress(ctx context.Context, messages []*consumer.Message) {
-	consumer.DeleteAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, messages)
-}
-
 func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
 		return false, fmt.Errorf("nil message received")
@@ -51,8 +47,8 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to unmarshal payment egress payload (id=%s): %w", msg.ID, err)
 	}
 
-	if egressPayload.WorkflowID == "" && msg.ID != "" {
-		egressPayload.WorkflowID = msg.ID
+	if egressPayload.WorkflowID == "" {
+		return false, fmt.Errorf("missing workflow ID in message payload (id=%s)", msg.ID)
 	}
 
 	workflowUUID, err := uuid.Parse(egressPayload.WorkflowID)
@@ -93,14 +89,8 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to query workflow %s: %w", workflowUUID, err)
 	}
 
-	if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED {
+	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT && wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT {
 		log.Printf("Workflow %s is already in state %s; skipping duplicate processing", workflowUUID, wf.WorkflowState)
-		var t models.Ticket
-		queryExisting := `SELECT id, workflow_id, seat_ids, amount, COALESCE(payment_id, ''), COALESCE(customer_name, ''), COALESCE(customer_email, ''), status, created_at FROM tickets WHERE workflow_id = $1`
-		err := tx.QueryRow(ctx, queryExisting, workflowUUID).Scan(&t.ID, &t.WorkflowID, &t.SeatIDs, &t.Amount, &t.PaymentID, &t.CustomerName, &t.CustomerEmail, &t.Status, &t.CreatedAt)
-		if err == nil {
-			return true, nil
-		}
 		return true, nil
 	}
 
@@ -252,6 +242,6 @@ func ProcessPaymentEgressBatch(ctx context.Context, messages []*consumer.Message
 	}
 
 	if len(toDelete) > 0 {
-		deleteBatchFromPaymentEgress(ctx, toDelete)
+		consumer.DeleteAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, toDelete)
 	}
 }

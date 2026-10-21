@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,12 +42,28 @@ func main() {
 		log.Fatalf("Failed to convert interval to seconds: %v", err)
 	}
 
+	visTimeoutStr := os.Getenv("BOOKING_VISIBILITY_TIMEOUT_SECONDS")
+	if visTimeoutStr == "" {
+		visTimeoutStr = os.Getenv("BOOKING_INGRESS_VISIBILITY_TIMEOUT_SECONDS")
+	}
+	if visTimeoutStr == "" {
+		log.Fatalf("BOOKING_VISIBILITY_TIMEOUT_SECONDS is not set")
+	}
+	visTimeoutSec, err := strconv.Atoi(visTimeoutStr)
+	if err != nil || visTimeoutSec <= 0 {
+		log.Fatalf("Invalid BOOKING_VISIBILITY_TIMEOUT_SECONDS: %v", err)
+	}
+	shared.IngressVisibilityTimeout = int32(visTimeoutSec)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	shared.IngressQueueURL = os.Getenv("BOOKING_INGRESS_SQS_URL")
 	if shared.IngressQueueURL == "" {
 		log.Fatalf("BOOKING_INGRESS_SQS_URL is not set")
+	}
+	if !strings.Contains(shared.IngressQueueURL, ".fifo") {
+		log.Fatalf("BOOKING_INGRESS_SQS_URL '%s' must be a FIFO queue (must contain .fifo)", shared.IngressQueueURL)
 	}
 
 	shared.IngressSQSClient, err = sqs_config.NewDefaultSQSClient(ctx)

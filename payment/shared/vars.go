@@ -8,10 +8,11 @@ import (
 )
 
 var (
-	DBPool           *pgxpool.Pool
-	IngressSQSClient *sqs.Client
-	InitOnce         sync.Once
-	IngressQueueURL  string
+	DBPool                   *pgxpool.Pool
+	IngressSQSClient         *sqs.Client
+	InitOnce                 sync.Once
+	IngressQueueURL          string
+	IngressVisibilityTimeout int32
 )
 
 type PaymentWorkflowState string

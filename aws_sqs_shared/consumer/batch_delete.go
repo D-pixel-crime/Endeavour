@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -24,6 +25,9 @@ type BatchDeleteResult struct {
 func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message) (*BatchDeleteResult, error) {
 	if len(messages) == 0 {
 		return &BatchDeleteResult{}, nil
+	}
+	if !strings.Contains(queueURL, ".fifo") {
+		return nil, fmt.Errorf(" queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
 	}
 
 	if len(messages) > 10 {

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,27 +19,41 @@ type Message struct {
 	Type          string            `json:"type"`
 	Payload       map[string]any    `json:"payload"`
 	Timestamp     time.Time         `json:"timestamp"`
+	CreatedAt     time.Time         `json:"created_at,omitempty"`
 	ReceiptHandle string            `json:"-"`
 	Attributes    map[string]string `json:"-"`
 }
 
+func (msg *Message) GetCreatedAt() time.Time {
+	if !msg.CreatedAt.IsZero() {
+		return msg.CreatedAt
+	}
+	if !msg.Timestamp.IsZero() {
+		return msg.Timestamp
+	}
+	return time.Now()
+}
+
 func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, maxMessages int32, waitTimeSeconds int32, visibilityTimeout int32) ([]*Message, error) {
+	if !strings.Contains(queueURL, ".fifo") {
+		return nil, fmt.Errorf(" queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
+	}
+
 	if maxMessages <= 0 || maxMessages > 10 {
 		maxMessages = 10
-	}
-	if visibilityTimeout <= 0 {
-		visibilityTimeout = 30
 	}
 
 	input := &sqs.ReceiveMessageInput{
 		QueueUrl:              aws.String(queueURL),
 		MaxNumberOfMessages:   maxMessages,
-		VisibilityTimeout:     visibilityTimeout,
 		WaitTimeSeconds:       waitTimeSeconds,
 		MessageAttributeNames: []string{"All"},
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameAll,
 		},
+	}
+	if visibilityTimeout > 0 {
+		input.VisibilityTimeout = visibilityTimeout
 	}
 
 	result, err := client.ReceiveMessage(ctx, input)
@@ -55,12 +71,31 @@ func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, m
 
 		msg.ReceiptHandle = *sqsMsg.ReceiptHandle
 		msg.Attributes = sqsMsg.Attributes
+
+		if msg.CreatedAt.IsZero() {
+			if !msg.Timestamp.IsZero() {
+				msg.CreatedAt = msg.Timestamp
+			} else if msg.Payload != nil {
+				if caStr, ok := msg.Payload["created_at"].(string); ok && caStr != "" {
+					if t, err := time.Parse(time.RFC3339, caStr); err == nil {
+						msg.CreatedAt = t
+					}
+				}
+			}
+			if msg.CreatedAt.IsZero() && msg.Attributes != nil {
+				if sentTsStr, ok := msg.Attributes["SentTimestamp"]; ok && sentTsStr != "" {
+					if ms, err := strconv.ParseInt(sentTsStr, 10, 64); err == nil {
+						msg.CreatedAt = time.UnixMilli(ms)
+					}
+				}
+			}
+			if msg.CreatedAt.IsZero() {
+				msg.CreatedAt = time.Now()
+			}
+		}
+
 		messages = append(messages, &msg)
 	}
 
 	return messages, nil
-}
-
-func ReceiveBatch(ctx context.Context, client *sqs.Client, queueURL string, maxMessages int32) ([]*Message, error) {
-	return ReceiveMessages(ctx, client, queueURL, maxMessages, 0, 30)
 }

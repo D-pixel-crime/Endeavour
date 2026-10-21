@@ -28,11 +28,12 @@ func resolveMaxConcurrency(maxConcurrency []int) int {
 func StartBookingEgressPoller(ctx context.Context, interval time.Duration, maxConcurrency ...int) {
 	limit := resolveMaxConcurrency(maxConcurrency)
 	bp := consumer.NewBatchPoller(consumer.PollerConfig{
-		Name:           "Orchestrator Booking Egress",
-		Client:         shared_vars.BookingEgressSQSClient,
-		QueueURL:       shared_vars.BookingEgressQueueURL,
-		Interval:       interval,
-		MaxConcurrency: limit,
+		Name:              "Orchestrator Booking Egress",
+		Client:            shared_vars.BookingEgressSQSClient,
+		QueueURL:          shared_vars.BookingEgressQueueURL,
+		Interval:          interval,
+		MaxConcurrency:    limit,
+		VisibilityTimeout: shared_vars.BookingEgressVisibilityTimeout,
 	}, egresshandlers.ProcessBookingEgressBatch)
 	bp.Start(ctx)
 }
@@ -40,11 +41,12 @@ func StartBookingEgressPoller(ctx context.Context, interval time.Duration, maxCo
 func StartPaymentEgressPoller(ctx context.Context, interval time.Duration, maxConcurrency ...int) {
 	limit := resolveMaxConcurrency(maxConcurrency)
 	bp := consumer.NewBatchPoller(consumer.PollerConfig{
-		Name:           "Orchestrator Payment Egress",
-		Client:         shared_vars.PaymentEgressSQSClient,
-		QueueURL:       shared_vars.PaymentEgressQueueURL,
-		Interval:       interval,
-		MaxConcurrency: limit,
+		Name:              "Orchestrator Payment Egress",
+		Client:            shared_vars.PaymentEgressSQSClient,
+		QueueURL:          shared_vars.PaymentEgressQueueURL,
+		Interval:          interval,
+		MaxConcurrency:    limit,
+		VisibilityTimeout: shared_vars.PaymentEgressVisibilityTimeout,
 	}, egresshandlers.ProcessPaymentEgressBatch)
 	bp.Start(ctx)
 }

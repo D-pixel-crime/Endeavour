@@ -24,10 +24,6 @@ type BookingEgressPayload struct {
 	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
 }
 
-func deleteBatchFromBookingEgress(ctx context.Context, messages []*consumer.Message) {
-	consumer.DeleteAllBatches(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, messages)
-}
-
 func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
 		return false, fmt.Errorf("nil message received")
@@ -47,8 +43,8 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to unmarshal booking egress payload (id=%s): %w", msg.ID, err)
 	}
 
-	if egressPayload.WorkflowID == "" && msg.ID != "" {
-		egressPayload.WorkflowID = msg.ID
+	if egressPayload.WorkflowID == "" {
+		return false, fmt.Errorf("missing workflow ID in message payload (id=%s)", msg.ID)
 	}
 
 	workflowUUID, err := uuid.Parse(egressPayload.WorkflowID)
@@ -89,7 +85,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to query workflow %s: %w", workflowUUID, err)
 	}
 
-	if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT || wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED {
+	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING && wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING {
 		log.Printf("Workflow %s is already in state %s; skipping duplicate processing", workflowUUID, wf.WorkflowState)
 		return true, nil
 	}
@@ -118,7 +114,13 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to marshal updated workflow payload for %s: %w", workflowUUID, err)
 	}
 
-	updateWorkflowQuery := `UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '30 seconds' WHERE id = $3`
+	paymentTimeout := shared_vars.PaymentTaskTimeoutSeconds
+	if paymentTimeout <= 0 {
+		paymentTimeout = 15
+	}
+	stateTimeoutSec := paymentTimeout + 5
+
+	updateWorkflowQuery := fmt.Sprintf(`UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds' WHERE id = $3`, stateTimeoutSec)
 	_, err = tx.Exec(ctx, updateWorkflowQuery, shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT, updatedWorkflowPayload, workflowUUID)
 	if err != nil {
 		return false, fmt.Errorf("failed to update workflow %s: %w", workflowUUID, err)
@@ -157,8 +159,8 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 
 	outboxID := uuid.New()
-	outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, 15, NOW())`
-	_, err = tx.Exec(ctx, outboxInsert, outboxID, workflowUUID, shared_vars.PAYMENT_WORKER, paymentPayloadBytes)
+	outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+	_, err = tx.Exec(ctx, outboxInsert, outboxID, workflowUUID, shared_vars.PAYMENT_WORKER, paymentPayloadBytes, paymentTimeout)
 	if err != nil {
 		return false, fmt.Errorf("failed to insert outbox message for %s: %w", workflowUUID, err)
 	}
@@ -191,6 +193,6 @@ func ProcessBookingEgressBatch(ctx context.Context, messages []*consumer.Message
 	}
 
 	if len(toDelete) > 0 {
-		deleteBatchFromBookingEgress(ctx, toDelete)
+		consumer.DeleteAllBatches(ctx, shared_vars.BookingEgressSQSClient, shared_vars.BookingEgressQueueURL, toDelete)
 	}
 }
