@@ -13,12 +13,12 @@ import (
 )
 
 type BookingIngressPayload struct {
-	WorkflowID       string `json:"workflow_id"`
-	NumSeats         int    `json:"num_seats"`
-	UpdatedAt        string `json:"updated_at,omitempty"`
-	CreatedAt        string `json:"created_at,omitempty"`
-	TimeoutParameter int    `json:"timeout_parameter,omitempty"`
-	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
+	WorkflowID       uuid.UUID `json:"workflow_id"`
+	NumSeats         int       `json:"num_seats"`
+	UpdatedAt        string    `json:"updated_at,omitempty"`
+	CreatedAt        string    `json:"created_at,omitempty"`
+	TimeoutParameter int       `json:"timeout_parameter,omitempty"`
+	TimeoutSeconds   int       `json:"timeout_seconds,omitempty"`
 }
 
 func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
@@ -40,14 +40,11 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		return false, fmt.Errorf("failed to unmarshal booking ingress payload (id=%s): %w", msg.ID, err)
 	}
 
-	if ingressPayload.WorkflowID == "" {
-		return false, fmt.Errorf("missing workflow ID in message payload (id=%s)", msg.ID)
+	if ingressPayload.WorkflowID == uuid.Nil {
+		return false, fmt.Errorf("missing or invalid workflow ID in message payload (id=%s)", msg.ID)
 	}
 
-	workflowUUID, err := uuid.Parse(ingressPayload.WorkflowID)
-	if err != nil {
-		return false, fmt.Errorf("invalid workflow ID '%s' in message (id=%s): %w", ingressPayload.WorkflowID, msg.ID, err)
-	}
+	workflowUUID := ingressPayload.WorkflowID
 
 	if ingressPayload.NumSeats <= 0 {
 		if rawNumSeats, ok := msg.Payload["num_seats"]; ok {

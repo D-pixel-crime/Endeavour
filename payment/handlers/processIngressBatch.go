@@ -20,7 +20,7 @@ type CustomerDetails struct {
 }
 
 type PaymentIngressPayload struct {
-	WorkflowID       string           `json:"workflow_id"`
+	WorkflowID       uuid.UUID        `json:"workflow_id"`
 	Amount           int              `json:"amount"`
 	NumSeats         int              `json:"num_seats"`
 	SeatIDs          []string         `json:"seat_ids"`
@@ -51,14 +51,11 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		return false, fmt.Errorf("failed to unmarshal payment ingress payload (id=%s): %w", msg.ID, err)
 	}
 
-	if ingressPayload.WorkflowID == "" {
-		return false, fmt.Errorf("missing workflow ID in message payload (id=%s)", msg.ID)
+	if ingressPayload.WorkflowID == uuid.Nil {
+		return false, fmt.Errorf("missing or invalid workflow ID in message payload (id=%s)", msg.ID)
 	}
 
-	workflowUUID, err := uuid.Parse(ingressPayload.WorkflowID)
-	if err != nil {
-		return false, fmt.Errorf("invalid workflow ID '%s' in message (id=%s): %w", ingressPayload.WorkflowID, msg.ID, err)
-	}
+	workflowUUID := ingressPayload.WorkflowID
 
 	paymentMethod := ingressPayload.PaymentMethod
 	if paymentMethod == "" && ingressPayload.CustomerDetails != nil {

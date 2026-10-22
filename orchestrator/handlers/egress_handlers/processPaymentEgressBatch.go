@@ -15,18 +15,18 @@ import (
 )
 
 type PaymentEgressPayload struct {
-	WorkflowID       string   `json:"workflow_id"`
-	Status           string   `json:"status"`
-	Amount           int      `json:"amount"`
-	PaymentMethod    string   `json:"payment_method,omitempty"`
-	PaymentID        string   `json:"payment_id,omitempty"`
-	SeatIDs          []string `json:"seat_ids,omitempty"`
-	NumSeats         int      `json:"num_seats,omitempty"`
-	Reason           string   `json:"reason,omitempty"`
-	UpdatedAt        string   `json:"updated_at,omitempty"`
-	CreatedAt        string   `json:"created_at,omitempty"`
-	TimeoutParameter int      `json:"timeout_parameter,omitempty"`
-	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
+	WorkflowID       uuid.UUID `json:"workflow_id"`
+	Status           string    `json:"status"`
+	Amount           int       `json:"amount"`
+	PaymentMethod    string    `json:"payment_method,omitempty"`
+	PaymentID        string    `json:"payment_id,omitempty"`
+	SeatIDs          []string  `json:"seat_ids,omitempty"`
+	NumSeats         int       `json:"num_seats,omitempty"`
+	Reason           string    `json:"reason,omitempty"`
+	UpdatedAt        string    `json:"updated_at,omitempty"`
+	CreatedAt        string    `json:"created_at,omitempty"`
+	TimeoutParameter int       `json:"timeout_parameter,omitempty"`
+	TimeoutSeconds   int       `json:"timeout_seconds,omitempty"`
 }
 
 func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
@@ -48,14 +48,11 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to unmarshal payment egress payload (id=%s): %w", msg.ID, err)
 	}
 
-	if egressPayload.WorkflowID == "" {
-		return false, fmt.Errorf("missing workflow ID in message payload (id=%s)", msg.ID)
+	if egressPayload.WorkflowID == uuid.Nil {
+		return false, fmt.Errorf("missing or invalid workflow ID in message payload (id=%s)", msg.ID)
 	}
 
-	workflowUUID, err := uuid.Parse(egressPayload.WorkflowID)
-	if err != nil {
-		return false, fmt.Errorf("invalid workflow ID '%s' in message (id=%s): %w", egressPayload.WorkflowID, msg.ID, err)
-	}
+	workflowUUID := egressPayload.WorkflowID
 
 	if egressPayload.Status != "COMPLETED" {
 		log.Printf("Workflow %s payment status is '%s' (not COMPLETED). Skipping failure handling for now.", workflowUUID, egressPayload.Status)

@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/google/uuid"
 )
 
 type BatchExtendError struct {
@@ -67,8 +68,8 @@ func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queue
 
 	entries := make([]types.ChangeMessageVisibilityBatchRequestEntry, len(messages))
 	for i, msg := range messages {
-		entryID := msg.ID
-		if entryID == "" {
+		entryID := msg.ID.String()
+		if msg.ID == uuid.Nil {
 			entryID = fmt.Sprintf("msg-%d", i)
 		}
 		entries[i] = types.ChangeMessageVisibilityBatchRequestEntry{

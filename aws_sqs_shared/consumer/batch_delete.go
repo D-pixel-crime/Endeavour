@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/google/uuid"
 )
 
 type BatchDeleteError struct {
@@ -36,8 +37,8 @@ func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string
 
 	entries := make([]types.DeleteMessageBatchRequestEntry, len(messages))
 	for i, msg := range messages {
-		entryID := msg.ID
-		if entryID == "" {
+		entryID := msg.ID.String()
+		if msg.ID == uuid.Nil {
 			entryID = fmt.Sprintf("msg-%d", i)
 		}
 		entries[i] = types.DeleteMessageBatchRequestEntry{

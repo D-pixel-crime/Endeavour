@@ -12,10 +12,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/google/uuid"
 )
 
 type Message struct {
-	ID            string            `json:"id"`
+	ID            uuid.UUID         `json:"id"`
 	Type          string            `json:"type"`
 	Payload       map[string]any    `json:"payload"`
 	Timestamp     time.Time         `json:"timestamp"`

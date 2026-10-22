@@ -8,11 +8,11 @@ import (
 )
 
 type ResBody struct {
-	WorkflowID string `json:"workflow_id"`
+	WorkflowID uuid.UUID `json:"workflow_id"`
 }
 
 func GenerateWorkflowID(c *gin.Context) {
-	newUUID := uuid.New().String()
+	newUUID := uuid.New()
 
 	resBody := ResBody{
 		WorkflowID: newUUID,

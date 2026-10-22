@@ -104,7 +104,7 @@ func (p *Poller) Start(ctx context.Context) {
 }
 
 type queuedItem struct {
-	outboxID string
+	outboxID uuid.UUID
 	msg      *producer.Message
 }
 
@@ -198,7 +198,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 	}
 	defer rows.Close()
 
-	var failedIDs = make(map[string]bool)
+	var failedIDs = make(map[uuid.UUID]bool)
 
 	var messages []OutboxMessage
 	for rows.Next() {
@@ -206,13 +206,13 @@ func (p *Poller) processBatch(ctx context.Context) {
 		if p.hasTimeoutCol {
 			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.TimeoutSeconds, &msg.UpdatedAt); err != nil {
 				log.Printf("Failed to scan outbox message: %v", err)
-				failedIDs[msg.ID.String()] = true
+				failedIDs[msg.ID] = true
 				continue
 			}
 		} else {
 			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.UpdatedAt); err != nil {
 				log.Printf("Failed to scan outbox message: %v", err)
-				failedIDs[msg.ID.String()] = true
+				failedIDs[msg.ID] = true
 				continue
 			}
 		}
@@ -235,43 +235,45 @@ func (p *Poller) processBatch(ctx context.Context) {
 		queueURL, err := p.router.ResolveQueue(msg.WorkerType)
 		if err != nil {
 			log.Printf("Failed to route message %s (worker_type: %s): %v", msg.ID, msg.WorkerType, err)
-			failedIDs[msg.ID.String()] = true
+			failedIDs[msg.ID] = true
 			continue
 		}
 
 		if !strings.Contains(queueURL, ".fifo") {
 			log.Printf("Skipping message %s (worker_type: %s): target queue '%s' is not a FIFO queue (must contain .fifo)", msg.ID, msg.WorkerType, queueURL)
-			failedIDs[msg.ID.String()] = true
+			failedIDs[msg.ID] = true
 			continue
 		}
 
 		payloadMap, msgTimestamp, err := p.PrepareMessagePayload(msg)
 		if err != nil {
 			log.Printf("Failed to prepare payload for message %s: %v", msg.ID, err)
-			failedIDs[msg.ID.String()] = true
+			failedIDs[msg.ID] = true
 			continue
 		}
 
-		groupID := ""
-		if msg.WorkflowID != uuid.Nil {
-			groupID = msg.WorkflowID.String()
-		} else if wfID, ok := payloadMap["workflow_id"].(string); ok && wfID != "" {
-			groupID = wfID
+		workflowUUID := msg.WorkflowID
+		if workflowUUID == uuid.Nil {
+			if wfIDStr, ok := payloadMap["workflow_id"].(string); ok && wfIDStr != "" {
+				if parsed, err := uuid.Parse(wfIDStr); err == nil {
+					workflowUUID = parsed
+				}
+			}
 		}
-		if groupID == "" {
-			log.Printf("message %s (worker_type: %s) has no workflow_id; cannot determine MessageGroupId", msg.ID, msg.WorkerType)
-			failedIDs[msg.ID.String()] = true
+		if workflowUUID == uuid.Nil {
+			log.Printf("message %s (worker_type: %s) has no valid workflow_id; cannot determine MessageGroupId", msg.ID, msg.WorkerType)
+			failedIDs[msg.ID] = true
 			continue
 		}
 
 		batchesByQueue[queueURL] = append(batchesByQueue[queueURL], &queuedItem{
-			outboxID: msg.ID.String(),
+			outboxID: msg.ID,
 			msg: &producer.Message{
-				ID:              msg.ID.String(),
+				ID:              msg.ID,
 				Type:            msg.WorkerType,
 				Payload:         payloadMap,
 				Timestamp:       msgTimestamp,
-				GroupID:         groupID,
+				GroupID:         workflowUUID.String(),
 				DeduplicationID: msg.ID.String(),
 			},
 		})
@@ -293,7 +295,9 @@ func (p *Poller) processBatch(ctx context.Context) {
 		}
 
 		for _, f := range res.Failed {
-			failedIDs[f.MessageID] = true
+			if failedUUID, err := uuid.Parse(f.MessageID); err == nil {
+				failedIDs[failedUUID] = true
+			}
 			log.Printf("Failed to send message %s to SQS %s: %s - %s", f.MessageID, queueURL, f.Code, f.Message)
 		}
 	}
@@ -306,22 +310,31 @@ func (p *Poller) processBatch(ctx context.Context) {
 	defer tx.Rollback(ctx)
 
 	deletedCount := 0
-	for _, msg := range messages {
-		msgID := msg.ID.String()
-		if failedIDs[msgID] {
-			_, err := tx.Exec(ctx, `UPDATE outbox SET processing = false, updated_at = NOW() WHERE id = $1`, msgID)
-			if err != nil {
-				log.Printf("Failed to mark outbox message %s as not processing: %v", msgID, err)
-			}
-			continue
-		}
 
-		_, err := tx.Exec(ctx, `DELETE FROM outbox WHERE id = $1`, msg.ID)
-		if err != nil {
-			log.Printf("Failed to delete outbox message %s: %v", msgID, err)
+	var toUpdate, toDelete []uuid.UUID
+	for _, msg := range messages {
+		if failedIDs[msg.ID] {
+			toUpdate = append(toUpdate, msg.ID)
 		} else {
-			deletedCount++
+			toDelete = append(toDelete, msg.ID)
 		}
+	}
+
+	if len(toUpdate) > 0 {
+		_, err := tx.Exec(ctx, `UPDATE outbox SET processing = false, updated_at = NOW() WHERE id = ANY($1::uuid[])`, toUpdate)
+		if err != nil {
+			log.Printf("Failed to update outbox messages: %v", err)
+			return
+		}
+	}
+
+	if len(toDelete) > 0 {
+		tag, err := tx.Exec(ctx, `DELETE FROM outbox WHERE id = ANY($1::uuid[])`, toDelete)
+		if err != nil {
+			log.Printf("Failed to delete outbox messages: %v", err)
+			return
+		}
+		deletedCount = int(tag.RowsAffected())
 	}
 
 	if err := tx.Commit(ctx); err != nil {

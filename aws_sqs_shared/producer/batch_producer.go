@@ -36,8 +36,8 @@ func (producer *Producer) sendSingleBatch(
 	entries := make([]types.SendMessageBatchRequestEntry, len(messages))
 
 	for i, msg := range messages {
-		if msg.ID == "" {
-			msg.ID = uuid.New().String()
+		if msg.ID == uuid.Nil {
+			msg.ID = uuid.New()
 		}
 		if msg.Timestamp.IsZero() {
 			msg.Timestamp = time.Now().UTC()
@@ -49,7 +49,7 @@ func (producer *Producer) sendSingleBatch(
 		}
 
 		entry := types.SendMessageBatchRequestEntry{
-			Id:          aws.String(msg.ID),
+			Id:          aws.String(msg.ID.String()),
 			MessageBody: aws.String(string(body)),
 			MessageAttributes: map[string]types.MessageAttributeValue{
 				"MessageType": {
@@ -58,7 +58,7 @@ func (producer *Producer) sendSingleBatch(
 				},
 				"CorrelationId": {
 					DataType:    aws.String("String"),
-					StringValue: aws.String(msg.ID),
+					StringValue: aws.String(msg.ID.String()),
 				},
 			},
 		}
@@ -78,10 +78,11 @@ func (producer *Producer) sendSingleBatch(
 		}
 		entry.MessageGroupId = aws.String(groupID)
 
-		if msg.DeduplicationID == "" {
-			return nil, fmt.Errorf("MessageDeduplicationId is missing for message %s on FIFO queue %s", msg.ID, queueURL)
+		dedupID := msg.DeduplicationID
+		if dedupID == "" {
+			dedupID = msg.ID.String()
 		}
-		entry.MessageDeduplicationId = aws.String(msg.DeduplicationID)
+		entry.MessageDeduplicationId = aws.String(dedupID)
 
 		entries[i] = entry
 	}

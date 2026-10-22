@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/google/uuid"
 )
 
 type Producer struct {
@@ -28,7 +29,7 @@ func NewProducer(client *sqs.Client, queueURL ...string) *Producer {
 }
 
 type Message struct {
-	ID              string         `json:"id"`
+	ID              uuid.UUID      `json:"id"`
 	Type            string         `json:"type"`
 	Payload         map[string]any `json:"payload"`
 	Timestamp       time.Time      `json:"timestamp"`
