@@ -146,13 +146,13 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 	var toExtend []*Message
 	var maxRequiredVisibilitySec int32 = p.cfg.VisibilityTimeout
 
-	// Check completion time from createdAt and processTimeout for each message
+	// Check completion time from updatedAt and processTimeout for each message
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
 
-		createdAt := msg.GetCreatedAt()
+		updatedAt := msg.GetUpdatedAt()
 		procTimeout := p.cfg.ProcessTimeout
 		if msg.Payload != nil {
 			if ts, ok := msg.Payload["timeout_seconds"].(float64); ok && ts > 0 {
@@ -166,8 +166,8 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 			batchTimeout = procTimeout
 		}
 
-		// Calculate completion time from createdAt and processTimeout
-		completionTime := createdAt.Add(procTimeout)
+		// Calculate completion time from updatedAt and processTimeout
+		completionTime := updatedAt.Add(procTimeout)
 
 		// If completion time exceeds the visibilityPeriod, mark for visibility extension
 		if completionTime.After(currentDeadline) || receivedAt.Add(procTimeout).After(currentDeadline) {
@@ -184,7 +184,7 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 		if maxRequiredVisibilitySec > 43200 { // AWS SQS maximum visibility timeout is 12 hours
 			maxRequiredVisibilitySec = 43200
 		}
-		log.Printf("[%s Poller] Completion time from createdAt and processTimeout exceeds visibilityPeriod (%v); extending visibility to %ds for %d message(s)",
+		log.Printf("[%s Poller] Completion time from updatedAt and processTimeout exceeds visibilityPeriod (%v); extending visibility to %ds for %d message(s)",
 			p.cfg.Name, visibilityTimeout, maxRequiredVisibilitySec, len(toExtend))
 		if _, err := ExtendAllBatchesVisibility(ctx, p.cfg.Client, p.cfg.QueueURL, toExtend, maxRequiredVisibilitySec); err != nil {
 			log.Printf("[%s Poller] Failed to extend visibility: %v", p.cfg.Name, err)

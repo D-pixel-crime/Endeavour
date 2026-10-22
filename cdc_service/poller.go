@@ -109,7 +109,7 @@ type queuedItem struct {
 }
 
 // PrepareMessagePayload enriches and validates the outbox payload, ensuring
-// created_at and timeout_parameter/timeout_seconds are always attached to the workflow task.
+// updated_at and timeout_parameter/timeout_seconds are always attached to the workflow task.
 func (p *Poller) PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.Time, error) {
 	var payloadMap map[string]any
 	if len(msg.Payload) > 0 {
@@ -125,13 +125,17 @@ func (p *Poller) PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.
 		payloadMap["workflow_id"] = msg.WorkflowID.String()
 	}
 
-	// Ensure created_at is present in the task payload
-	createdAtStr := msg.CreatedAt.UTC().Format(time.RFC3339)
-	if msg.CreatedAt.IsZero() {
-		createdAtStr = time.Now().UTC().Format(time.RFC3339)
+	// Ensure updated_at is present in the task payload
+	updatedAtStr := msg.UpdatedAt.UTC().Format(time.RFC3339)
+	if msg.UpdatedAt.IsZero() {
+		updatedAtStr = time.Now().UTC().Format(time.RFC3339)
 	}
+	if _, ok := payloadMap["updated_at"]; !ok {
+		payloadMap["updated_at"] = updatedAtStr
+	}
+	// Also ensure created_at is present for backwards compatibility
 	if _, ok := payloadMap["created_at"]; !ok {
-		payloadMap["created_at"] = createdAtStr
+		payloadMap["created_at"] = updatedAtStr
 	}
 
 	// Ensure timeout_parameter and timeout_seconds are present in the task payload
@@ -150,7 +154,7 @@ func (p *Poller) PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.
 	payloadMap["timeout_parameter"] = timeoutSec
 	payloadMap["timeout_seconds"] = timeoutSec
 
-	msgTimestamp := msg.CreatedAt.UTC()
+	msgTimestamp := msg.UpdatedAt.UTC()
 	if msgTimestamp.IsZero() {
 		msgTimestamp = time.Now().UTC()
 	}
@@ -170,29 +174,45 @@ func (p *Poller) processBatch(ctx context.Context) {
 
 	var query string
 	if p.hasTimeoutCol {
-		query = fmt.Sprintf(`SELECT id, workflow_id, worker_type, payload, timeout_seconds, created_at FROM outbox ORDER BY created_at LIMIT %d FOR UPDATE SKIP LOCKED`, p.batchSize)
+		query = `
+				WITH targets AS (
+					SELECT id FROM outbox WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') ORDER BY updated_at LIMIT $1 FOR UPDATE SKIP LOCKED
+				) 
+				UPDATE outbox SET processing = true, updated_at = NOW()
+				WHERE id IN (SELECT id FROM targets)
+				RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.timeout_seconds, outbox.updated_at`
 	} else {
-		query = fmt.Sprintf(`SELECT id, workflow_id, worker_type, payload, created_at FROM outbox ORDER BY created_at LIMIT %d FOR UPDATE SKIP LOCKED`, p.batchSize)
+		query = `
+				WITH targets AS (
+					SELECT id FROM outbox WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') ORDER BY updated_at LIMIT $1 FOR UPDATE SKIP LOCKED
+				) 
+				UPDATE outbox SET processing = true, updated_at = NOW()
+				WHERE id IN (SELECT id FROM targets)
+				RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.updated_at`
 	}
 
-	rows, err := tx.Query(ctx, query)
+	rows, err := tx.Query(ctx, query, p.batchSize)
 	if err != nil {
 		log.Printf("Failed to query outbox: %v", err)
 		return
 	}
 	defer rows.Close()
 
+	var failedIDs = make(map[string]bool)
+
 	var messages []OutboxMessage
 	for rows.Next() {
 		var msg OutboxMessage
 		if p.hasTimeoutCol {
-			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.TimeoutSeconds, &msg.CreatedAt); err != nil {
+			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.TimeoutSeconds, &msg.UpdatedAt); err != nil {
 				log.Printf("Failed to scan outbox message: %v", err)
+				failedIDs[msg.ID.String()] = true
 				continue
 			}
 		} else {
-			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.CreatedAt); err != nil {
+			if err := rows.Scan(&msg.ID, &msg.WorkflowID, &msg.WorkerType, &msg.Payload, &msg.UpdatedAt); err != nil {
 				log.Printf("Failed to scan outbox message: %v", err)
+				failedIDs[msg.ID.String()] = true
 				continue
 			}
 		}
@@ -200,12 +220,16 @@ func (p *Poller) processBatch(ctx context.Context) {
 	}
 	rows.Close()
 
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("Failed to commit transaction: %v", err)
+		return // Rolls back here
+	}
+
 	if len(messages) == 0 {
 		return
 	}
 
 	batchesByQueue := make(map[string][]*queuedItem)
-	failedIDs := make(map[string]bool)
 
 	for _, msg := range messages {
 		queueURL, err := p.router.ResolveQueue(msg.WorkerType)
@@ -235,7 +259,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 			groupID = wfID
 		}
 		if groupID == "" {
-			log.Printf("Grave error: message %s (worker_type: %s) has no workflow_id; cannot determine MessageGroupId", msg.ID, msg.WorkerType)
+			log.Printf("message %s (worker_type: %s) has no workflow_id; cannot determine MessageGroupId", msg.ID, msg.WorkerType)
 			failedIDs[msg.ID.String()] = true
 			continue
 		}
@@ -274,10 +298,21 @@ func (p *Poller) processBatch(ctx context.Context) {
 		}
 	}
 
+	tx, err = p.dbPool.Begin(ctx)
+	if err != nil {
+		log.Printf("Failed to begin transaction: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
 	deletedCount := 0
 	for _, msg := range messages {
 		msgID := msg.ID.String()
 		if failedIDs[msgID] {
+			_, err := tx.Exec(ctx, `UPDATE outbox SET processing = false, updated_at = NOW() WHERE id = $1`, msgID)
+			if err != nil {
+				log.Printf("Failed to mark outbox message %s as not processing: %v", msgID, err)
+			}
 			continue
 		}
 

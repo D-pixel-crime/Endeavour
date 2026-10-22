@@ -23,6 +23,7 @@ type PaymentEgressPayload struct {
 	SeatIDs          []string `json:"seat_ids,omitempty"`
 	NumSeats         int      `json:"num_seats,omitempty"`
 	Reason           string   `json:"reason,omitempty"`
+	UpdatedAt        string   `json:"updated_at,omitempty"`
 	CreatedAt        string   `json:"created_at,omitempty"`
 	TimeoutParameter int      `json:"timeout_parameter,omitempty"`
 	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
@@ -58,7 +59,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	if egressPayload.Status != "COMPLETED" {
 		log.Printf("Workflow %s payment status is '%s' (not COMPLETED). Skipping failure handling for now.", workflowUUID, egressPayload.Status)
-		return false, nil
+		return true, nil
 	}
 
 	if shared_vars.Orchestrator_DB_Pool == nil {

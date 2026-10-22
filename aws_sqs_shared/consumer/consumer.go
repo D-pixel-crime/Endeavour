@@ -19,12 +19,16 @@ type Message struct {
 	Type          string            `json:"type"`
 	Payload       map[string]any    `json:"payload"`
 	Timestamp     time.Time         `json:"timestamp"`
+	UpdatedAt     time.Time         `json:"updated_at,omitempty"`
 	CreatedAt     time.Time         `json:"created_at,omitempty"`
 	ReceiptHandle string            `json:"-"`
 	Attributes    map[string]string `json:"-"`
 }
 
-func (msg *Message) GetCreatedAt() time.Time {
+func (msg *Message) GetUpdatedAt() time.Time {
+	if !msg.UpdatedAt.IsZero() {
+		return msg.UpdatedAt
+	}
 	if !msg.CreatedAt.IsZero() {
 		return msg.CreatedAt
 	}
@@ -32,6 +36,10 @@ func (msg *Message) GetCreatedAt() time.Time {
 		return msg.Timestamp
 	}
 	return time.Now()
+}
+
+func (msg *Message) GetCreatedAt() time.Time {
+	return msg.GetUpdatedAt()
 }
 
 func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, maxMessages int32, waitTimeSeconds int32, visibilityTimeout int32) ([]*Message, error) {
@@ -72,26 +80,33 @@ func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, m
 		msg.ReceiptHandle = *sqsMsg.ReceiptHandle
 		msg.Attributes = sqsMsg.Attributes
 
-		if msg.CreatedAt.IsZero() {
-			if !msg.Timestamp.IsZero() {
-				msg.CreatedAt = msg.Timestamp
+		if msg.UpdatedAt.IsZero() {
+			if !msg.CreatedAt.IsZero() {
+				msg.UpdatedAt = msg.CreatedAt
+			} else if !msg.Timestamp.IsZero() {
+				msg.UpdatedAt = msg.Timestamp
 			} else if msg.Payload != nil {
-				if caStr, ok := msg.Payload["created_at"].(string); ok && caStr != "" {
+				if uaStr, ok := msg.Payload["updated_at"].(string); ok && uaStr != "" {
+					if t, err := time.Parse(time.RFC3339, uaStr); err == nil {
+						msg.UpdatedAt = t
+					}
+				} else if caStr, ok := msg.Payload["created_at"].(string); ok && caStr != "" {
 					if t, err := time.Parse(time.RFC3339, caStr); err == nil {
-						msg.CreatedAt = t
+						msg.UpdatedAt = t
 					}
 				}
 			}
-			if msg.CreatedAt.IsZero() && msg.Attributes != nil {
+			if msg.UpdatedAt.IsZero() && msg.Attributes != nil {
 				if sentTsStr, ok := msg.Attributes["SentTimestamp"]; ok && sentTsStr != "" {
 					if ms, err := strconv.ParseInt(sentTsStr, 10, 64); err == nil {
-						msg.CreatedAt = time.UnixMilli(ms)
+						msg.UpdatedAt = time.UnixMilli(ms)
 					}
 				}
 			}
-			if msg.CreatedAt.IsZero() {
-				msg.CreatedAt = time.Now()
+			if msg.UpdatedAt.IsZero() {
+				msg.UpdatedAt = time.Now()
 			}
+			msg.CreatedAt = msg.UpdatedAt
 		}
 
 		messages = append(messages, &msg)

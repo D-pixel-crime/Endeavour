@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/consumer"
 	"github.com/D-pixel-crime/Endeavour/booking/shared"
@@ -14,6 +15,7 @@ import (
 type BookingIngressPayload struct {
 	WorkflowID       string `json:"workflow_id"`
 	NumSeats         int    `json:"num_seats"`
+	UpdatedAt        string `json:"updated_at,omitempty"`
 	CreatedAt        string `json:"created_at,omitempty"`
 	TimeoutParameter int    `json:"timeout_parameter,omitempty"`
 	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
@@ -119,6 +121,7 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 			"workflow_id":       workflowUUID.String(),
 			"status":            "FAILED",
 			"reason":            fmt.Sprintf("insufficient seats: requested %d, available %d", ingressPayload.NumSeats, len(seatIDs)),
+			"updated_at":        time.Now().UTC().Format(time.RFC3339),
 			"timeout_parameter": timeoutParam,
 			"timeout_seconds":   timeoutParam,
 		}
@@ -141,6 +144,7 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 			"status":            "COMPLETED",
 			"seat_ids":          seatIDStrings,
 			"num_seats":         ingressPayload.NumSeats,
+			"updated_at":        time.Now().UTC().Format(time.RFC3339),
 			"timeout_parameter": timeoutParam,
 			"timeout_seconds":   timeoutParam,
 		}
@@ -165,7 +169,7 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO outbox (id, workflow_id, worker_type, payload, created_at)
+		`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
 		 VALUES ($1, $2, 'BOOKING', $3, NOW())`,
 		outboxID, workflowUUID, outboxPayloadBytes,
 	)

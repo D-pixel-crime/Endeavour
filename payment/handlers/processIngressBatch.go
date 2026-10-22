@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/consumer"
 	"github.com/D-pixel-crime/Endeavour/payment/shared"
@@ -25,6 +26,7 @@ type PaymentIngressPayload struct {
 	SeatIDs          []string         `json:"seat_ids"`
 	PaymentMethod    string           `json:"payment_method"`
 	CustomerDetails  *CustomerDetails `json:"customer_details,omitempty"`
+	UpdatedAt        string           `json:"updated_at,omitempty"`
 	CreatedAt        string           `json:"created_at,omitempty"`
 	TimeoutParameter int              `json:"timeout_parameter,omitempty"`
 	TimeoutSeconds   int              `json:"timeout_seconds,omitempty"`
@@ -147,6 +149,7 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		"payment_id":        paymentID.String(),
 		"seat_ids":          ingressPayload.SeatIDs,
 		"num_seats":         ingressPayload.NumSeats,
+		"updated_at":        time.Now().UTC().Format(time.RFC3339),
 		"timeout_parameter": timeoutParam,
 		"timeout_seconds":   timeoutParam,
 	}
@@ -156,7 +159,7 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO outbox (id, workflow_id, worker_type, payload, created_at)
+		`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
 		 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
 		outboxID, workflowUUID, outboxPayloadBytes,
 	)

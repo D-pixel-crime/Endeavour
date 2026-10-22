@@ -13,5 +13,6 @@ type OutboxMessage struct {
 	WorkerType     string          `db:"worker_type"`
 	Payload        json.RawMessage `db:"payload"`
 	TimeoutSeconds int             `db:"timeout_seconds"`
-	CreatedAt      time.Time       `db:"created_at"`
+	UpdatedAt      time.Time       `db:"updated_at"`
+	Processing     bool            `db:"processing"`
 }

@@ -25,7 +25,8 @@ CREATE TABLE outbox (
     worker_type worker_type NOT NULL,
     payload JSONB NOT NULL,
     timeout_seconds INT NOT NULL DEFAULT 15,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    processing BOOLEAN NOT NULL DEFAULT FALSE,
     FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE
 );
 
@@ -38,7 +39,7 @@ CREATE TABLE seat (
     CONSTRAINT uq_train_seat UNIQUE (train_id, seat_number)
 );
 
-CREATE INDEX idx_outbox_created_at ON outbox(created_at);
+CREATE INDEX idx_outbox_updated_at ON outbox(updated_at);
 CREATE INDEX idx_seat_available ON seat(train_id, seat_number) WHERE is_booked = false;
 
 -- Initial Seed of 100 Seats

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/consumer"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/db/models"
@@ -19,6 +20,7 @@ type BookingEgressPayload struct {
 	SeatIDs          []string `json:"seat_ids"`
 	NumSeats         int      `json:"num_seats"`
 	Reason           string   `json:"reason,omitempty"`
+	UpdatedAt        string   `json:"updated_at,omitempty"`
 	CreatedAt        string   `json:"created_at,omitempty"`
 	TimeoutParameter int      `json:"timeout_parameter,omitempty"`
 	TimeoutSeconds   int      `json:"timeout_seconds,omitempty"`
@@ -54,7 +56,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	if egressPayload.Status != "COMPLETED" {
 		log.Printf("Workflow %s booking status is '%s' (not COMPLETED). Skipping failure handling for now.", workflowUUID, egressPayload.Status)
-		return false, nil
+		return true, nil
 	}
 
 	if shared_vars.Orchestrator_DB_Pool == nil {
@@ -137,6 +139,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		"seat_ids":    egressPayload.SeatIDs,
 		"num_seats":   numSeats,
 		"amount":      amount,
+		"updated_at":  time.Now().UTC().Format(time.RFC3339),
 	}
 
 	if customerDetails, ok := currentPayload["customer_details"]; ok {
@@ -159,7 +162,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 
 	outboxID := uuid.New()
-	outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+	outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
 	_, err = tx.Exec(ctx, outboxInsert, outboxID, workflowUUID, shared_vars.PAYMENT_WORKER, paymentPayloadBytes, paymentTimeout)
 	if err != nil {
 		return false, fmt.Errorf("failed to insert outbox message for %s: %w", workflowUUID, err)

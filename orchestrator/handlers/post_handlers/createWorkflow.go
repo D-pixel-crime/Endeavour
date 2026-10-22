@@ -8,6 +8,7 @@ import (
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type customerDetails struct {
@@ -80,17 +81,19 @@ func CreateWorkflow(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 
-	var checkWorkflowExists string = `SELECT id FROM workflows WHERE id = $1`
+	var checkWorkflowExists string = `SELECT id, workflow_state FROM workflows WHERE id = $1`
 	var workflow_id uuid.UUID
-	if err = shared_vars.Orchestrator_DB_Pool.QueryRow(ctx, checkWorkflowExists, req.WorkflowID).Scan(&workflow_id); err != nil {
+	var workflow_state shared_vars.Orchestrator_WorkflowState
+	if err = tx.QueryRow(ctx, checkWorkflowExists, req.WorkflowID).Scan(&workflow_id, &workflow_state); err != nil && err != pgx.ErrNoRows {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to assess existence of Workflow!",
 		})
 		return
 	}
 	if workflow_id != uuid.Nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Workflow Already Exists",
+		c.JSON(http.StatusAlreadyReported, gin.H{
+			"Success": "Workflow Already Exists",
+			"State":   workflow_state,
 		})
 		return
 	}
@@ -110,7 +113,7 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
 	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails, bookingTimeout)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -127,7 +130,7 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusAccepted, gin.H{
 		"message":     "Workflow created successfully",
 		"workflow_id": req.WorkflowID,
 	})
