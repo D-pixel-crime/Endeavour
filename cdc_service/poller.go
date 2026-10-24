@@ -176,17 +176,29 @@ func (p *Poller) processBatch(ctx context.Context) {
 	if p.hasTimeoutCol {
 		query = `
 				WITH targets AS (
-					SELECT id FROM outbox WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') ORDER BY updated_at LIMIT $1 FOR UPDATE SKIP LOCKED
+					SELECT id 
+					FROM outbox 
+					WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') 
+					ORDER BY updated_at 
+					LIMIT $1 
+					FOR UPDATE SKIP LOCKED
 				) 
-				UPDATE outbox SET processing = true, updated_at = NOW()
+				UPDATE outbox 
+				SET processing = true, updated_at = NOW()
 				WHERE id IN (SELECT id FROM targets)
 				RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.timeout_seconds, outbox.updated_at`
 	} else {
 		query = `
 				WITH targets AS (
-					SELECT id FROM outbox WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') ORDER BY updated_at LIMIT $1 FOR UPDATE SKIP LOCKED
+					SELECT id 
+					FROM outbox 
+					WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') 
+					ORDER BY updated_at 
+					LIMIT $1 
+					FOR UPDATE SKIP LOCKED
 				) 
-				UPDATE outbox SET processing = true, updated_at = NOW()
+				UPDATE outbox 
+				SET processing = true, updated_at = NOW()
 				WHERE id IN (SELECT id FROM targets)
 				RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.updated_at`
 	}
@@ -218,7 +230,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 		}
 		messages = append(messages, msg)
 	}
-	rows.Close()
+	rows.Close() // idempotent operation
 
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
@@ -309,8 +321,6 @@ func (p *Poller) processBatch(ctx context.Context) {
 	}
 	defer tx.Rollback(ctx)
 
-	deletedCount := 0
-
 	var toUpdate, toDelete []uuid.UUID
 	for _, msg := range messages {
 		if failedIDs[msg.ID] {
@@ -320,21 +330,23 @@ func (p *Poller) processBatch(ctx context.Context) {
 		}
 	}
 
-	if len(toUpdate) > 0 {
-		_, err := tx.Exec(ctx, `UPDATE outbox SET processing = false, updated_at = NOW() WHERE id = ANY($1::uuid[])`, toUpdate)
+	if len(toUpdate) > 0 || len(toDelete) > 0 {
+		combinedQuery := `WITH deletes AS (
+								DELETE FROM outbox 
+								WHERE id = ANY($1::uuid[])
+								RETURNING id
+						)
+						UPDATE outbox 
+						SET processing = true, updated_at = NOW()
+						WHERE id = ANY($2::uuid[])
+						`
+
+		_, err := tx.Exec(ctx, combinedQuery, toDelete, toUpdate)
 		if err != nil {
 			log.Printf("Failed to update outbox messages: %v", err)
 			return
 		}
-	}
 
-	if len(toDelete) > 0 {
-		tag, err := tx.Exec(ctx, `DELETE FROM outbox WHERE id = ANY($1::uuid[])`, toDelete)
-		if err != nil {
-			log.Printf("Failed to delete outbox messages: %v", err)
-			return
-		}
-		deletedCount = int(tag.RowsAffected())
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -342,7 +354,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 		return
 	}
 
-	if deletedCount > 0 {
-		log.Printf("Successfully processed and deleted %d/%d messages from outbox", deletedCount, len(messages))
+	if len(toDelete) > 0 {
+		log.Printf("Successfully processed and deleted %d/%d messages from outbox", len(toDelete), len(messages))
 	}
 }

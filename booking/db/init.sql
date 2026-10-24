@@ -36,11 +36,13 @@ CREATE TABLE seat (
     seat_number VARCHAR(255) NOT NULL,
     cost INT NOT NULL DEFAULT 500,
     is_booked BOOLEAN NOT NULL DEFAULT false,
+    booked_by_workflow_id UUID,
     CONSTRAINT uq_train_seat UNIQUE (train_id, seat_number)
 );
 
 CREATE INDEX idx_outbox_updated_at ON outbox(updated_at);
 CREATE INDEX idx_seat_available ON seat(train_id, seat_number) WHERE is_booked = false;
+CREATE INDEX idx_seat_booked_by ON seat(booked_by_workflow_id) WHERE booked_by_workflow_id IS NOT NULL;
 
 -- Initial Seed of 100 Seats
 

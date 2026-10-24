@@ -51,11 +51,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	workflowUUID := egressPayload.WorkflowID
 
-	if egressPayload.Status != "COMPLETED" {
-		log.Printf("Workflow %s booking status is '%s' (not COMPLETED). Skipping failure handling for now.", workflowUUID, egressPayload.Status)
-		return true, nil
-	}
-
 	if shared_vars.Orchestrator_DB_Pool == nil {
 		return false, fmt.Errorf("database pool is not initialized")
 	}
@@ -84,11 +79,6 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to query workflow %s: %w", workflowUUID, err)
 	}
 
-	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING && wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING {
-		log.Printf("Workflow %s is already in state %s; skipping duplicate processing", workflowUUID, wf.WorkflowState)
-		return true, nil
-	}
-
 	var currentPayload map[string]any
 	if len(wf.Payload) > 0 {
 		if err := json.Unmarshal(wf.Payload, &currentPayload); err != nil {
@@ -98,6 +88,68 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 	if currentPayload == nil {
 		currentPayload = make(map[string]any)
+	}
+
+	// 1. Booking Failed -> First step failed, no prior steps to compensate
+	if egressPayload.Status == shared_vars.STATUS_FAILED {
+		currentPayload["booking_failure"] = map[string]any{
+			"status":    egressPayload.Status,
+			"reason":    egressPayload.Reason,
+			"failed_at": time.Now().UTC().Format(time.RFC3339),
+		}
+		updatedPayloadBytes, err := json.Marshal(currentPayload)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal payload for %s: %w", workflowUUID, err)
+		}
+
+		updateQuery := `UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NULL WHERE id = $3`
+		_, err = tx.Exec(ctx, updateQuery, shared_vars.ORCHESTRATOR_WORKFLOW_FAILED, updatedPayloadBytes, workflowUUID)
+		if err != nil {
+			return false, fmt.Errorf("failed to update workflow %s to FAILED: %w", workflowUUID, err)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
+		}
+
+		log.Printf("Workflow %s booking failed at start of workflow; marked as FAILED with no prior steps to compensate", workflowUUID)
+		return true, nil
+	}
+
+	// 2. Booking Compensated -> Start reached, backward compensation complete
+	if egressPayload.Status == shared_vars.STATUS_COMPENSATED {
+		currentPayload["booking_compensation"] = map[string]any{
+			"status":         egressPayload.Status,
+			"compensated_at": time.Now().UTC().Format(time.RFC3339),
+		}
+		updatedPayloadBytes, err := json.Marshal(currentPayload)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal payload for %s: %w", workflowUUID, err)
+		}
+
+		updateQuery := `UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NULL WHERE id = $3`
+		_, err = tx.Exec(ctx, updateQuery, shared_vars.ORCHESTRATOR_WORKFLOW_FAILED, updatedPayloadBytes, workflowUUID)
+		if err != nil {
+			return false, fmt.Errorf("failed to update workflow %s to FAILED: %w", workflowUUID, err)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
+		}
+
+		log.Printf("[SAGA ROLLBACK] Booking compensated for workflow %s; reached start of workflow. Full compensation complete!", workflowUUID)
+		return true, nil
+	}
+
+	// 3. Normal Forward Booking Completed
+	if egressPayload.Status != shared_vars.STATUS_COMPLETED {
+		log.Printf("Workflow %s booking status is '%s'; unhandled status", workflowUUID, egressPayload.Status)
+		return true, nil
+	}
+
+	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING {
+		log.Printf("Workflow %s is in state %s (expected BOOKING); skipping advance to payment", workflowUUID, wf.WorkflowState)
+		return true, nil
 	}
 
 	currentPayload["booking"] = map[string]any{

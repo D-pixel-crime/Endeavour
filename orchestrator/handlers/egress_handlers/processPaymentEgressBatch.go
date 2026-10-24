@@ -54,11 +54,6 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	workflowUUID := egressPayload.WorkflowID
 
-	if egressPayload.Status != "COMPLETED" {
-		log.Printf("Workflow %s payment status is '%s' (not COMPLETED). Skipping failure handling for now.", workflowUUID, egressPayload.Status)
-		return true, nil
-	}
-
 	if shared_vars.Orchestrator_DB_Pool == nil {
 		return false, fmt.Errorf("database pool is not initialized")
 	}
@@ -87,11 +82,6 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to query workflow %s: %w", workflowUUID, err)
 	}
 
-	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT && wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT {
-		log.Printf("Workflow %s is already in state %s; skipping duplicate processing", workflowUUID, wf.WorkflowState)
-		return true, nil
-	}
-
 	var currentPayload map[string]any
 	if len(wf.Payload) > 0 {
 		if err := json.Unmarshal(wf.Payload, &currentPayload); err != nil {
@@ -101,6 +91,115 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 	if currentPayload == nil {
 		currentPayload = make(map[string]any)
+	}
+
+	// 1. Payment Failed -> Start backward compensation from PAYMENT backwards
+	if egressPayload.Status == shared_vars.STATUS_FAILED {
+		currentPayload["payment_failure"] = map[string]any{
+			"status":    egressPayload.Status,
+			"reason":    egressPayload.Reason,
+			"failed_at": time.Now().UTC().Format(time.RFC3339),
+		}
+		updatedPayloadBytes, err := json.Marshal(currentPayload)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal payload for %s: %w", workflowUUID, err)
+		}
+
+		timeoutSec := 15
+		stateTimeoutSec := timeoutSec + 5
+		updateQuery := fmt.Sprintf(`UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds' WHERE id = $3`, stateTimeoutSec)
+		_, err = tx.Exec(ctx, updateQuery, shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT, updatedPayloadBytes, workflowUUID)
+		if err != nil {
+			return false, fmt.Errorf("failed to update workflow %s to COMPENSATING_PAYMENT: %w", workflowUUID, err)
+		}
+
+		compensatePaymentPayload := map[string]any{
+			"workflow_id":       workflowUUID.String(),
+			"action":            shared_vars.ACTION_COMPENSATE,
+			"reason":            egressPayload.Reason,
+			"updated_at":        time.Now().UTC().Format(time.RFC3339),
+			"timeout_seconds":   timeoutSec,
+			"timeout_parameter": timeoutSec,
+		}
+		compensateBytes, _ := json.Marshal(compensatePaymentPayload)
+
+		outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+		_, err = tx.Exec(ctx, outboxInsert, uuid.New(), workflowUUID, shared_vars.PAYMENT_WORKER, compensateBytes, timeoutSec)
+		if err != nil {
+			return false, fmt.Errorf("failed to insert payment compensation outbox for %s: %w", workflowUUID, err)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
+		}
+
+		log.Printf("[SAGA ROLLBACK] Payment failed for workflow %s; started backward compensation at PAYMENT", workflowUUID)
+		return true, nil
+	}
+
+	// 2. Payment Compensated -> Move backward to previous service: BOOKING
+	if egressPayload.Status == shared_vars.STATUS_COMPENSATED {
+		currentPayload["payment_compensation"] = map[string]any{
+			"status":         egressPayload.Status,
+			"compensated_at": time.Now().UTC().Format(time.RFC3339),
+		}
+		updatedPayloadBytes, err := json.Marshal(currentPayload)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal payload for %s: %w", workflowUUID, err)
+		}
+
+		timeoutSec := 15
+		stateTimeoutSec := timeoutSec + 5
+		updateQuery := fmt.Sprintf(`UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds' WHERE id = $3`, stateTimeoutSec)
+		_, err = tx.Exec(ctx, updateQuery, shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING, updatedPayloadBytes, workflowUUID)
+		if err != nil {
+			return false, fmt.Errorf("failed to update workflow %s to COMPENSATING_BOOKING: %w", workflowUUID, err)
+		}
+
+		seatIDs := egressPayload.SeatIDs
+		if len(seatIDs) == 0 {
+			if rawSeats, ok := currentPayload["seat_ids"].([]any); ok {
+				for _, s := range rawSeats {
+					if str, ok := s.(string); ok {
+						seatIDs = append(seatIDs, str)
+					}
+				}
+			}
+		}
+
+		compensateBookingPayload := map[string]any{
+			"workflow_id":       workflowUUID.String(),
+			"action":            shared_vars.ACTION_COMPENSATE,
+			"seat_ids":          seatIDs,
+			"updated_at":        time.Now().UTC().Format(time.RFC3339),
+			"timeout_seconds":   timeoutSec,
+			"timeout_parameter": timeoutSec,
+		}
+		compensateBookingBytes, _ := json.Marshal(compensateBookingPayload)
+
+		outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+		_, err = tx.Exec(ctx, outboxInsert, uuid.New(), workflowUUID, shared_vars.BOOKING_WORKER, compensateBookingBytes, timeoutSec)
+		if err != nil {
+			return false, fmt.Errorf("failed to insert booking compensation outbox for %s: %w", workflowUUID, err)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
+		}
+
+		log.Printf("[SAGA ROLLBACK] Payment compensated for workflow %s; continuing backward compensation to BOOKING", workflowUUID)
+		return true, nil
+	}
+
+	// 3. Normal Forward Payment Completed
+	if egressPayload.Status != shared_vars.STATUS_COMPLETED {
+		log.Printf("Workflow %s payment status is '%s'; unhandled status", workflowUUID, egressPayload.Status)
+		return true, nil
+	}
+
+	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT {
+		log.Printf("Workflow %s is in state %s (expected PAYMENT); skipping ticket creation", workflowUUID, wf.WorkflowState)
+		return true, nil
 	}
 
 	var customerName string

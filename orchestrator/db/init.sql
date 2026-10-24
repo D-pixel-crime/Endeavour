@@ -3,13 +3,12 @@ CREATE TYPE workflow_type as ENUM (
 );
 
 CREATE TYPE orchestrator_workflow_state as ENUM (
-    'INITIALIZED',
-    'PENDING',
     'BOOKING',
     'PAYMENT',
     'COMPLETED',
     'FAILED',
-    'COMPENSATING'
+    'COMPENSATING_PAYMENT',
+    'COMPENSATING_BOOKING'
     );
 
 CREATE TYPE worker_type as ENUM(
