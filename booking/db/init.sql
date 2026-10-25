@@ -27,6 +27,8 @@ CREATE TABLE outbox (
     timeout_seconds INT NOT NULL DEFAULT 15,
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     processing BOOLEAN NOT NULL DEFAULT FALSE,
+    retry_count INT NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE
 );
 

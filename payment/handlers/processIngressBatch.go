@@ -49,11 +49,13 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 
 	var ingressPayload PaymentIngressPayload
 	if err := json.Unmarshal(payloadBytes, &ingressPayload); err != nil {
-		return false, fmt.Errorf("failed to unmarshal payment ingress payload (id=%s): %w", msg.ID, err)
+		log.Printf("[POISON PILL DETECTED] Unmarshal failed for payment message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
+		return true, nil
 	}
 
 	if ingressPayload.WorkflowID == uuid.Nil {
-		return false, fmt.Errorf("missing or invalid workflow ID in message payload (id=%s)", msg.ID)
+		log.Printf("[POISON PILL DETECTED] Missing or invalid workflow ID in payment message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
+		return true, nil
 	}
 
 	workflowUUID := ingressPayload.WorkflowID
@@ -180,13 +182,21 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 
 		var existingState string
 		err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
-		if err == nil && existingState == string(shared.PAYMENT_WORKFLOW_COMPLETED) {
-			tx.Rollback(ctx)
-			log.Printf("Workflow %s payment is already COMPLETED; skipping duplicate processing", workflowUUID)
-			return true, nil
+		if err == nil {
+			if existingState == string(shared.PAYMENT_WORKFLOW_COMPLETED) {
+				tx.Rollback(ctx)
+				log.Printf("Workflow %s payment is already COMPLETED; skipping duplicate processing", workflowUUID)
+				return true, nil
+			}
+			if existingState == string(shared.PAYMENT_WORKFLOW_FAILED) || existingState == string(shared.PAYMENT_WORKFLOW_COMPENSATING) {
+				tx.Rollback(ctx)
+				log.Printf("Workflow %s is in terminal/compensating state (%s); skipping duplicate execution to prevent state regression", workflowUUID, existingState)
+				return true, nil
+			}
 		}
 
-		paymentID := uuid.New()
+		// Deterministic payment_id derived from workflow UUID to ensure payment gateway idempotency across all retries
+		paymentID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("payment:"+workflowUUID.String()))
 		_, err = tx.Exec(ctx,
 			`INSERT INTO payments (id, workflow_id, amount, payment_method, status, created_at)
 			 VALUES ($1, $2, $3, $4, 'COMPLETED', NOW())
@@ -304,15 +314,23 @@ func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
 			continue
 		}
 
-		shouldDelete, err := ProcessPaymentIngressMessage(ctx, msg)
-		if err != nil {
-			log.Printf("Error processing payment message %s: %v", msg.ID, err)
-			continue
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic processing payment message %s: %v", msg.ID, r)
+				}
+			}()
 
-		if shouldDelete {
-			toDelete = append(toDelete, msg)
-		}
+			shouldDelete, err := ProcessPaymentIngressMessage(ctx, msg)
+			if err != nil {
+				log.Printf("Error processing payment message %s: %v", msg.ID, err)
+				return
+			}
+
+			if shouldDelete {
+				toDelete = append(toDelete, msg)
+			}
+		}()
 	}
 
 	if len(toDelete) > 0 {

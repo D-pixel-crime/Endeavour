@@ -39,11 +39,13 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 
 	var ingressPayload BookingIngressPayload
 	if err := json.Unmarshal(payloadBytes, &ingressPayload); err != nil {
-		return false, fmt.Errorf("failed to unmarshal booking ingress payload (id=%s): %w", msg.ID, err)
+		log.Printf("[POISON PILL DETECTED] Unmarshal failed for booking message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
+		return true, nil
 	}
 
 	if ingressPayload.WorkflowID == uuid.Nil {
-		return false, fmt.Errorf("missing or invalid workflow ID in message payload (id=%s)", msg.ID)
+		log.Printf("[POISON PILL DETECTED] Missing or invalid workflow ID in booking message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
+		return true, nil
 	}
 
 	workflowUUID := ingressPayload.WorkflowID
@@ -154,11 +156,18 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		}
 
 		var existingState string
-		err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1`, workflowUUID).Scan(&existingState)
-		if err == nil && existingState == string(shared.BOOKING_WORKFLOW_COMPLETED) {
-			tx.Rollback(ctx)
-			log.Printf("Workflow %s is already COMPLETED; skipping duplicate processing", workflowUUID)
-			return true, nil
+		err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
+		if err == nil {
+			if existingState == string(shared.BOOKING_WORKFLOW_COMPLETED) {
+				tx.Rollback(ctx)
+				log.Printf("Workflow %s is already COMPLETED; skipping duplicate processing", workflowUUID)
+				return true, nil
+			}
+			if existingState == string(shared.BOOKING_WORKFLOW_FAILED) || existingState == string(shared.BOOKING_WORKFLOW_COMPENSATING) {
+				tx.Rollback(ctx)
+				log.Printf("Workflow %s is in terminal/compensating state (%s); skipping duplicate execution to prevent state regression", workflowUUID, existingState)
+				return true, nil
+			}
 		}
 
 		rows, err := tx.Query(ctx,
@@ -310,15 +319,23 @@ func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
 			continue
 		}
 
-		shouldDelete, err := ProcessBookingIngressMessage(ctx, msg)
-		if err != nil {
-			log.Printf("Error processing message %s: %v", msg.ID, err)
-			continue
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic processing booking message %s: %v", msg.ID, r)
+				}
+			}()
 
-		if shouldDelete {
-			toDelete = append(toDelete, msg)
-		}
+			shouldDelete, err := ProcessBookingIngressMessage(ctx, msg)
+			if err != nil {
+				log.Printf("Error processing message %s: %v", msg.ID, err)
+				return
+			}
+
+			if shouldDelete {
+				toDelete = append(toDelete, msg)
+			}
+		}()
 	}
 
 	if len(toDelete) > 0 {

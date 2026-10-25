@@ -15,6 +15,7 @@ import (
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
 	api_routes "github.com/D-pixel-crime/Endeavour/orchestrator/api_routes"
 	db "github.com/D-pixel-crime/Endeavour/orchestrator/db"
+	"github.com/D-pixel-crime/Endeavour/orchestrator/middleware"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/poller"
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/gin-gonic/gin"
@@ -128,12 +129,36 @@ func main() {
 		log.Println("WARNING: PAYMENT_EGRESS_SQS_URL is not set. Payment egress poller will not run.")
 	}
 
+	// Rate Limiting & Concurrency Configuration
+	postRPS := getEnvFloat("RATE_LIMIT_POST_RPS", 10.0)
+	postBurst := getEnvInt("RATE_LIMIT_POST_BURST", 20)
+	getRPS := getEnvFloat("RATE_LIMIT_GET_RPS", 50.0)
+	getBurst := getEnvInt("RATE_LIMIT_GET_BURST", 100)
+	maxConcurrentCreates := getEnvInt("MAX_CONCURRENT_WORKFLOW_CREATIONS", 25)
+
+	postLimiter := middleware.NewTokenBucketLimiter(middleware.LimiterConfig{
+		RPS:   postRPS,
+		Burst: postBurst,
+	})
+	defer postLimiter.Stop()
+
+	getLimiter := middleware.NewTokenBucketLimiter(middleware.LimiterConfig{
+		RPS:   getRPS,
+		Burst: getBurst,
+	})
+	defer getLimiter.Stop()
+
+	concurrencyLimiter := middleware.NewConcurrencyLimiter(maxConcurrentCreates)
+	defer middleware.GlobalIdempotencyCache.Stop()
+
 	r := gin.Default()
 
 	getRouter := r.Group("/get")
+	getRouter.Use(getLimiter.Middleware())
 	api_routes.GetRoutes(getRouter)
 
 	postRouter := r.Group("/post")
+	postRouter.Use(postLimiter.Middleware(), concurrencyLimiter.Middleware())
 	api_routes.PostRoutes(postRouter)
 
 	port := os.Getenv("ORCHESTRATOR_PORT")
@@ -183,4 +208,22 @@ func main() {
 	}
 
 	log.Println("Shutdown complete")
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil && i > 0 {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvFloat(key string, defaultVal float64) float64 {
+	if val := os.Getenv(key); val != "" {
+		if f, err := strconv.ParseFloat(val, 64); err == nil && f > 0 {
+			return f
+		}
+	}
+	return defaultVal
 }

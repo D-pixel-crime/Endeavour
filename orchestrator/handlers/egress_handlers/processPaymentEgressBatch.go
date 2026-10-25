@@ -106,7 +106,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		}
 
 		timeoutSec := 15
-		stateTimeoutSec := timeoutSec + 5
+		stateTimeoutSec := timeoutSec + 20
 		updateQuery := fmt.Sprintf(`UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds' WHERE id = $3`, stateTimeoutSec)
 		_, err = tx.Exec(ctx, updateQuery, shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT, updatedPayloadBytes, workflowUUID)
 		if err != nil {
@@ -149,7 +149,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		}
 
 		timeoutSec := 15
-		stateTimeoutSec := timeoutSec + 5
+		stateTimeoutSec := timeoutSec + 20
 		updateQuery := fmt.Sprintf(`UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds' WHERE id = $3`, stateTimeoutSec)
 		_, err = tx.Exec(ctx, updateQuery, shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING, updatedPayloadBytes, workflowUUID)
 		if err != nil {
@@ -319,7 +319,6 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 }
 
 func ProcessPaymentEgressBatch(ctx context.Context, messages []*consumer.Message) {
-
 	var toDelete []*consumer.Message
 
 	for _, msg := range messages {
@@ -327,15 +326,23 @@ func ProcessPaymentEgressBatch(ctx context.Context, messages []*consumer.Message
 			continue
 		}
 
-		shouldDelete, err := ProcessPaymentEgressMessage(ctx, msg)
-		if err != nil {
-			log.Printf("Error processing payment egress message %s: %v", msg.ID, err)
-			continue
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic processing payment egress message %s: %v", msg.ID, r)
+				}
+			}()
 
-		if shouldDelete {
-			toDelete = append(toDelete, msg)
-		}
+			shouldDelete, err := ProcessPaymentEgressMessage(ctx, msg)
+			if err != nil {
+				log.Printf("Error processing payment egress message %s: %v", msg.ID, err)
+				return
+			}
+
+			if shouldDelete {
+				toDelete = append(toDelete, msg)
+			}
+		}()
 	}
 
 	if len(toDelete) > 0 {

@@ -149,6 +149,32 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING {
 		log.Printf("Workflow %s is in state %s (expected BOOKING); skipping advance to payment", workflowUUID, wf.WorkflowState)
+
+		// Ghost allocation prevention: If seats were allocated in Booking DB but workflow is no longer in BOOKING state,
+		// release those seats by emitting a compensation outbox event.
+		if len(egressPayload.SeatIDs) > 0 {
+			compensateBookingPayload := map[string]any{
+				"workflow_id":       workflowUUID.String(),
+				"action":            shared_vars.ACTION_COMPENSATE,
+				"seat_ids":          egressPayload.SeatIDs,
+				"reason":            fmt.Sprintf("Ghost allocation release: completed after workflow state was %s", wf.WorkflowState),
+				"updated_at":        time.Now().UTC().Format(time.RFC3339),
+				"timeout_seconds":   15,
+				"timeout_parameter": 15,
+			}
+			compensateBookingBytes, _ := json.Marshal(compensateBookingPayload)
+			outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
+			_, err = tx.Exec(ctx, outboxInsert, uuid.New(), workflowUUID, shared_vars.BOOKING_WORKER, compensateBookingBytes, 15)
+			if err != nil {
+				return false, fmt.Errorf("failed to insert ghost seat compensation outbox for %s: %w", workflowUUID, err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return false, fmt.Errorf("failed to commit ghost seat compensation for %s: %w", workflowUUID, err)
+			}
+			log.Printf("[GHOST ALLOCATION RESOLVED] Dispatched compensation to release %d leaked seats for workflow %s (current state: %s)", len(egressPayload.SeatIDs), workflowUUID, wf.WorkflowState)
+			return true, nil
+		}
+
 		return true, nil
 	}
 
@@ -169,7 +195,8 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	if paymentTimeout <= 0 {
 		paymentTimeout = 15
 	}
-	stateTimeoutSec := paymentTimeout + 5
+	// Cascading rule: DB Timeout < Worker Processing (10-15s) < SQS Visibility (30s) < Orchestrator State Timeout (35-45s)
+	stateTimeoutSec := paymentTimeout + 20
 
 	updateWorkflowQuery := fmt.Sprintf(`UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds' WHERE id = $3`, stateTimeoutSec)
 	_, err = tx.Exec(ctx, updateWorkflowQuery, shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT, updatedWorkflowPayload, workflowUUID)
@@ -233,15 +260,23 @@ func ProcessBookingEgressBatch(ctx context.Context, messages []*consumer.Message
 			continue
 		}
 
-		shouldDelete, err := ProcessBookingEgressMessage(ctx, msg)
-		if err != nil {
-			log.Printf("Error processing booking egress message %s: %v", msg.ID, err)
-			continue
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic processing booking egress message %s: %v", msg.ID, r)
+				}
+			}()
 
-		if shouldDelete {
-			toDelete = append(toDelete, msg)
-		}
+			shouldDelete, err := ProcessBookingEgressMessage(ctx, msg)
+			if err != nil {
+				log.Printf("Error processing booking egress message %s: %v", msg.ID, err)
+				return
+			}
+
+			if shouldDelete {
+				toDelete = append(toDelete, msg)
+			}
+		}()
 	}
 
 	if len(toDelete) > 0 {

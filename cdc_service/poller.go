@@ -24,6 +24,7 @@ type Poller struct {
 	visibilityTimeout int
 	checkColOnce      sync.Once
 	hasTimeoutCol     bool
+	hasRetryCol       bool
 }
 
 func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, interval time.Duration, batchSize int, visibilityTimeout int, maxConcurrency ...int) *Poller {
@@ -60,6 +61,20 @@ func (p *Poller) checkTimeoutColumn(ctx context.Context) {
 			}
 		} else {
 			log.Printf("Warning: failed to check for timeout_seconds column in outbox: %v", err)
+		}
+
+		var existsRetry bool
+		err = p.dbPool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns 
+				WHERE table_name = 'outbox' AND column_name = 'retry_count'
+			)
+		`).Scan(&existsRetry)
+		if err == nil {
+			p.hasRetryCol = existsRetry
+			if existsRetry {
+				log.Println("CDC Poller detected 'retry_count' column in outbox table")
+			}
 		}
 	})
 }
@@ -163,22 +178,41 @@ func (p *Poller) PrepareMessagePayload(msg OutboxMessage) (map[string]any, time.
 }
 
 func (p *Poller) processBatch(ctx context.Context) {
-	tx, err := p.dbPool.Begin(ctx)
+	batchCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	tx, err := p.dbPool.Begin(batchCtx)
 	if err != nil {
 		log.Printf("Failed to begin transaction: %v", err)
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(batchCtx)
 
-	p.checkTimeoutColumn(ctx)
+	p.checkTimeoutColumn(batchCtx)
 
 	var query string
-	if p.hasTimeoutCol {
+	if p.hasRetryCol && p.hasTimeoutCol {
 		query = `
 				WITH targets AS (
 					SELECT id 
 					FROM outbox 
-					WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') 
+					WHERE (status IS NULL OR status != 'FAILED')
+					  AND (processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '30 seconds'))
+					  AND (retry_count < 5)
+					ORDER BY updated_at 
+					LIMIT $1 
+					FOR UPDATE SKIP LOCKED
+				) 
+				UPDATE outbox 
+				SET processing = true, updated_at = NOW()
+				WHERE id IN (SELECT id FROM targets)
+				RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.timeout_seconds, outbox.updated_at`
+	} else if p.hasTimeoutCol {
+		query = `
+				WITH targets AS (
+					SELECT id 
+					FROM outbox 
+					WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '30 seconds') 
 					ORDER BY updated_at 
 					LIMIT $1 
 					FOR UPDATE SKIP LOCKED
@@ -192,7 +226,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 				WITH targets AS (
 					SELECT id 
 					FROM outbox 
-					WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '2 minutes') 
+					WHERE processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '30 seconds') 
 					ORDER BY updated_at 
 					LIMIT $1 
 					FOR UPDATE SKIP LOCKED
@@ -203,7 +237,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 				RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.updated_at`
 	}
 
-	rows, err := tx.Query(ctx, query, p.batchSize)
+	rows, err := tx.Query(batchCtx, query, p.batchSize)
 	if err != nil {
 		log.Printf("Failed to query outbox: %v", err)
 		return
@@ -297,7 +331,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 			producerMessages[i] = item.msg
 		}
 
-		res, err := p.producer.SendBatch(ctx, queueURL, producerMessages)
+		res, err := p.producer.SendBatch(batchCtx, queueURL, producerMessages)
 		if err != nil {
 			log.Printf("Failed to push batch of %d messages to SQS queue %s: %v", len(batch), queueURL, err)
 			for _, item := range batch {
@@ -314,12 +348,12 @@ func (p *Poller) processBatch(ctx context.Context) {
 		}
 	}
 
-	tx, err = p.dbPool.Begin(ctx)
+	tx, err = p.dbPool.Begin(batchCtx)
 	if err != nil {
 		log.Printf("Failed to begin transaction: %v", err)
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(batchCtx)
 
 	var toUpdate, toDelete []uuid.UUID
 	for _, msg := range messages {
@@ -331,17 +365,33 @@ func (p *Poller) processBatch(ctx context.Context) {
 	}
 
 	if len(toUpdate) > 0 || len(toDelete) > 0 {
-		combinedQuery := `WITH deletes AS (
-								DELETE FROM outbox 
-								WHERE id = ANY($1::uuid[])
-								RETURNING id
-						)
-						UPDATE outbox 
-						SET processing = true, updated_at = NOW()
-						WHERE id = ANY($2::uuid[])
-						`
+		var combinedQuery string
+		if p.hasRetryCol {
+			combinedQuery = `WITH deletes AS (
+									DELETE FROM outbox 
+									WHERE id = ANY($1::uuid[])
+									RETURNING id
+							)
+							UPDATE outbox 
+							SET processing = false,
+							    retry_count = retry_count + 1,
+							    status = CASE WHEN retry_count + 1 >= 5 THEN 'FAILED' ELSE status END,
+							    updated_at = NOW()
+							WHERE id = ANY($2::uuid[])
+							`
+		} else {
+			combinedQuery = `WITH deletes AS (
+									DELETE FROM outbox 
+									WHERE id = ANY($1::uuid[])
+									RETURNING id
+							)
+							UPDATE outbox 
+							SET processing = false, updated_at = NOW()
+							WHERE id = ANY($2::uuid[])
+							`
+		}
 
-		_, err := tx.Exec(ctx, combinedQuery, toDelete, toUpdate)
+		_, err := tx.Exec(batchCtx, combinedQuery, toDelete, toUpdate)
 		if err != nil {
 			log.Printf("Failed to update outbox messages: %v", err)
 			return
@@ -349,7 +399,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(batchCtx); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
 		return
 	}

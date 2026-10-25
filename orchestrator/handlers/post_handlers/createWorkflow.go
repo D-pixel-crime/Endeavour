@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/D-pixel-crime/Endeavour/orchestrator/middleware"
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -21,6 +23,7 @@ type customerDetails struct {
 type reqBody struct {
 	WorkflowID      uuid.UUID                `json:"workflow_id"`
 	WorkflowType    shared_vars.WorkflowType `json:"workflow_type"`
+	NumSeats        int                      `json:"num_seats"`
 	CustomerDetails customerDetails          `json:"customer_details"`
 }
 
@@ -41,10 +44,16 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	customerDetails, err := json.Marshal(req.CustomerDetails)
-	if err != nil {
+	if req.NumSeats <= 0 || req.NumSeats > 10 {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Failed to marshal customer_details",
+			"error": "Invalid num_seats: must be between 1 and 10",
+		})
+		return
+	}
+
+	if req.CustomerDetails.Email == "" || req.CustomerDetails.FullName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Customer email and full_name are required",
 		})
 		return
 	}
@@ -63,14 +72,65 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	if len(customerDetails) == 2 {
+	wfPayload := map[string]any{
+		"workflow_id":      req.WorkflowID.String(),
+		"num_seats":        req.NumSeats,
+		"customer_details": req.CustomerDetails,
+		"payment_method":   req.CustomerDetails.PaymentMethod,
+		"email":            req.CustomerDetails.Email,
+		"full_name":        req.CustomerDetails.FullName,
+		"contact":          req.CustomerDetails.Contact,
+	}
+	wfPayloadBytes, err := json.Marshal(wfPayload)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "NO Customer Details",
+			"error": "Failed to marshal workflow payload",
 		})
 		return
 	}
 
 	ctx := c.Request.Context()
+
+	// 1. Fast in-memory idempotency check: eliminate DB connection overhead for duplicate checks
+	if cachedState, found := middleware.GlobalIdempotencyCache.Get(req.WorkflowID); found {
+		c.JSON(http.StatusAlreadyReported, gin.H{
+			"Success":     "Workflow Already Exists",
+			"State":       cachedState,
+			"workflow_id": req.WorkflowID,
+		})
+		return
+	}
+
+	// 2. In-flight singleflight lock: prevent parallel requests with identical workflow_id from racing on DB locks
+	unlock, acquired := middleware.GlobalIdempotencyCache.TryLock(req.WorkflowID)
+	if !acquired {
+		if middleware.GlobalIdempotencyCache.WaitForInFlight(ctx, req.WorkflowID, 1*time.Second) {
+			if cachedState, found := middleware.GlobalIdempotencyCache.Get(req.WorkflowID); found {
+				c.JSON(http.StatusAlreadyReported, gin.H{
+					"Success":     "Workflow Already Exists",
+					"State":       cachedState,
+					"workflow_id": req.WorkflowID,
+				})
+				return
+			}
+		}
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error": "A workflow with this ID is currently being processed. Please retry shortly.",
+		})
+		return
+	}
+	defer unlock()
+
+	// Double-check cache in case another goroutine finished while we were locking
+	if cachedState, found := middleware.GlobalIdempotencyCache.Get(req.WorkflowID); found {
+		c.JSON(http.StatusAlreadyReported, gin.H{
+			"Success":     "Workflow Already Exists",
+			"State":       cachedState,
+			"workflow_id": req.WorkflowID,
+		})
+		return
+	}
 
 	tx, err := shared_vars.Orchestrator_DB_Pool.Begin(ctx)
 	if err != nil {
@@ -81,7 +141,7 @@ func CreateWorkflow(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 
-	var checkWorkflowExists string = `SELECT id, workflow_state FROM workflows WHERE id = $1`
+	var checkWorkflowExists string = `SELECT id, workflow_state FROM workflows WHERE id = $1 FOR UPDATE`
 	var workflow_id uuid.UUID
 	var workflow_state shared_vars.Orchestrator_WorkflowState
 	if err = tx.QueryRow(ctx, checkWorkflowExists, req.WorkflowID).Scan(&workflow_id, &workflow_state); err != nil && err != pgx.ErrNoRows {
@@ -91,9 +151,11 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 	if workflow_id != uuid.Nil {
+		middleware.GlobalIdempotencyCache.Set(workflow_id, string(workflow_state))
 		c.JSON(http.StatusAlreadyReported, gin.H{
-			"Success": "Workflow Already Exists",
-			"State":   workflow_state,
+			"Success":     "Workflow Already Exists",
+			"State":       workflow_state,
+			"workflow_id": workflow_id,
 		})
 		return
 	}
@@ -102,10 +164,11 @@ func CreateWorkflow(c *gin.Context) {
 	if bookingTimeout <= 0 {
 		bookingTimeout = 15
 	}
-	stateTimeoutSec := bookingTimeout + 5
+	// Cascading rule: DB Timeout < Worker Processing (10-15s) < SQS Visibility (30s) < Orchestrator State Timeout (35-45s)
+	stateTimeoutSec := bookingTimeout + 20
 
-	var workflowInsert string = fmt.Sprintf(`INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '%d seconds') RETURNING id`, stateTimeoutSec)
-	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING, customerDetails)
+	var workflowInsert string = fmt.Sprintf(`INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '10 minutes', NOW() + INTERVAL '%d seconds') RETURNING id`, stateTimeoutSec)
+	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING, wfPayloadBytes)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert workflow",
@@ -113,8 +176,24 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
+	bookingOutboxPayload := map[string]any{
+		"workflow_id":       req.WorkflowID.String(),
+		"num_seats":         req.NumSeats,
+		"customer_details":  req.CustomerDetails,
+		"payment_method":    req.CustomerDetails.PaymentMethod,
+		"timeout_seconds":   bookingTimeout,
+		"timeout_parameter": bookingTimeout,
+	}
+	bookingOutboxBytes, err := json.Marshal(bookingOutboxPayload)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to marshal booking outbox payload",
+		})
+		return
+	}
+
 	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
-	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, customerDetails, bookingTimeout)
+	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, bookingOutboxBytes, bookingTimeout)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to insert outbox",
@@ -129,6 +208,9 @@ func CreateWorkflow(c *gin.Context) {
 		})
 		return
 	}
+
+	// Cache successful workflow creation state
+	middleware.GlobalIdempotencyCache.Set(req.WorkflowID, string(shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING))
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"message":     "Workflow created successfully",

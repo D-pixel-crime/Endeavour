@@ -12,7 +12,13 @@ type ResBody struct {
 }
 
 func GenerateWorkflowID(c *gin.Context) {
-	newUUID := uuid.New()
+	newUUID, err := uuid.NewRandom()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to generate workflow UUID",
+		})
+		return
+	}
 
 	resBody := ResBody{
 		WorkflowID: newUUID,

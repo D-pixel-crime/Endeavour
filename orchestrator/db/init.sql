@@ -34,10 +34,13 @@ CREATE TABLE outbox (
     timeout_seconds INT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     processing BOOLEAN NOT NULL DEFAULT FALSE,
+    retry_count INT NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     FOREIGN KEY (workflow_id) references workflows(id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_outbox_updated_at ON outbox(updated_at);
+CREATE INDEX idx_workflows_state_timeout ON workflows(state_timeout) WHERE state_timeout IS NOT NULL;
 
 CREATE TABLE tickets (
     id UUID PRIMARY KEY,

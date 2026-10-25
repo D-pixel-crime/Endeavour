@@ -16,4 +16,6 @@ type OutboxMessage struct {
 	TimeoutSeconds int               `db:"timeout_seconds"`
 	UpdatedAt      time.Time         `db:"updated_at"`
 	Processing     bool              `db:"processing"`
+	RetryCount     int               `db:"retry_count"`
+	Status         string            `db:"status"`
 }
