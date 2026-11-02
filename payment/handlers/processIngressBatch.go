@@ -195,6 +195,20 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 			}
 		}
 
+		_, err = tx.Exec(ctx,
+			`INSERT INTO workflows (id, workflow_state, payload)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (id) DO UPDATE
+			   SET workflow_state = EXCLUDED.workflow_state,
+			       payload = EXCLUDED.payload`,
+			workflowUUID, string(shared.PAYMENT_WORKFLOW_COMPLETED), payloadBytes,
+		)
+		if err != nil {
+			tx.Rollback(ctx)
+			lastErr = fmt.Errorf("failed to upsert workflow: %w", err)
+			continue
+		}
+
 		// Deterministic payment_id derived from workflow UUID to ensure payment gateway idempotency across all retries
 		paymentID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("payment:"+workflowUUID.String()))
 		_, err = tx.Exec(ctx,
@@ -209,20 +223,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		if err != nil {
 			tx.Rollback(ctx)
 			lastErr = fmt.Errorf("failed to insert payment record: %w", err)
-			continue
-		}
-
-		_, err = tx.Exec(ctx,
-			`INSERT INTO workflows (id, workflow_state, payload)
-			 VALUES ($1, $2, $3)
-			 ON CONFLICT (id) DO UPDATE
-			   SET workflow_state = EXCLUDED.workflow_state,
-			       payload = EXCLUDED.payload`,
-			workflowUUID, string(shared.PAYMENT_WORKFLOW_COMPLETED), payloadBytes,
-		)
-		if err != nil {
-			tx.Rollback(ctx)
-			lastErr = fmt.Errorf("failed to upsert workflow: %w", err)
 			continue
 		}
 

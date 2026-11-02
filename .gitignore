@@ -1,0 +1,10 @@
+# Binaries & logs
+.bin/
+.logs/
+*.log
+
+# Environment files
+**/.env
+**/*.env
+!**/example.env
+!**/example.*.env
