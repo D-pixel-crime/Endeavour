@@ -23,7 +23,8 @@ CREATE TABLE workflows (
     payload JSONB,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMP,
-    state_timeout TIMESTAMP
+    state_timeout TIMESTAMP,
+    retry_count INT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE outbox (

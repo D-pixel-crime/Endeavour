@@ -199,10 +199,7 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 	defer close(done)
 
 	go func() {
-		heartbeatInterval := time.Duration(p.cfg.VisibilityTimeout/2) * time.Second
-		if heartbeatInterval < time.Second {
-			heartbeatInterval = time.Second
-		}
+		heartbeatInterval := max(time.Duration(p.cfg.VisibilityTimeout/2)*time.Second, time.Second)
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 

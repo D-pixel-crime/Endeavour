@@ -59,7 +59,7 @@ func GetWorkflowByID(c *gin.Context) {
 	}
 
 	var wf models.Workflow
-	query := `SELECT id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout FROM workflows WHERE id = $1`
+	query := `SELECT id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout, retry_count FROM workflows WHERE id = $1`
 	err = shared_vars.Orchestrator_DB_Pool.QueryRow(c.Request.Context(), query, workflowUUID).Scan(
 		&wf.ID,
 		&wf.WorkflowType,
@@ -68,6 +68,7 @@ func GetWorkflowByID(c *gin.Context) {
 		&wf.CreatedAt,
 		&wf.ExpiresAt,
 		&wf.StateTimeout,
+		&wf.RetryCount,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {

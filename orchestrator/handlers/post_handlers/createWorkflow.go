@@ -73,13 +73,12 @@ func CreateWorkflow(c *gin.Context) {
 	}
 
 	wfPayload := map[string]any{
-		"workflow_id":      req.WorkflowID.String(),
-		"num_seats":        req.NumSeats,
-		"customer_details": req.CustomerDetails,
-		"payment_method":   req.CustomerDetails.PaymentMethod,
-		"email":            req.CustomerDetails.Email,
-		"full_name":        req.CustomerDetails.FullName,
-		"contact":          req.CustomerDetails.Contact,
+		"workflow_id":    req.WorkflowID.String(),
+		"num_seats":      req.NumSeats,
+		"payment_method": req.CustomerDetails.PaymentMethod,
+		"email":          req.CustomerDetails.Email,
+		"full_name":      req.CustomerDetails.FullName,
+		"contact":        req.CustomerDetails.Contact,
 	}
 	wfPayloadBytes, err := json.Marshal(wfPayload)
 	if err != nil {
@@ -122,16 +121,6 @@ func CreateWorkflow(c *gin.Context) {
 	}
 	defer unlock()
 
-	// Double-check cache in case another goroutine finished while we were locking
-	if cachedState, found := middleware.GlobalIdempotencyCache.Get(req.WorkflowID); found {
-		c.JSON(http.StatusAlreadyReported, gin.H{
-			"Success":     "Workflow Already Exists",
-			"State":       cachedState,
-			"workflow_id": req.WorkflowID,
-		})
-		return
-	}
-
 	tx, err := shared_vars.Orchestrator_DB_Pool.Begin(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -160,27 +149,20 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
+	visTimeout := int(shared_vars.BookingEgressVisibilityTimeout)
+	if visTimeout <= 0 {
+		visTimeout = 30
+	}
 	bookingTimeout := shared_vars.BookingTaskTimeoutSeconds
 	if bookingTimeout <= 0 {
-		bookingTimeout = 15
+		bookingTimeout = visTimeout / 2
 	}
-	// Cascading rule: DB Timeout < Worker Processing (10-15s) < SQS Visibility (30s) < Orchestrator State Timeout (35-45s)
-	stateTimeoutSec := bookingTimeout + 20
-
-	var workflowInsert string = fmt.Sprintf(`INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout) VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '10 minutes', NOW() + INTERVAL '%d seconds') RETURNING id`, stateTimeoutSec)
-	_, err = tx.Exec(ctx, workflowInsert, req.WorkflowID, req.WorkflowType, shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING, wfPayloadBytes)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to insert workflow",
-		})
-		return
-	}
+	// Cascading rule: DB Timeout < Worker Processing (V/2) < SQS Visibility (V) < Orchestrator State Timeout (V + TaskTimeout)
+	stateTimeoutSec := visTimeout + bookingTimeout
 
 	bookingOutboxPayload := map[string]any{
 		"workflow_id":       req.WorkflowID.String(),
 		"num_seats":         req.NumSeats,
-		"customer_details":  req.CustomerDetails,
-		"payment_method":    req.CustomerDetails.PaymentMethod,
 		"timeout_seconds":   bookingTimeout,
 		"timeout_parameter": bookingTimeout,
 	}
@@ -192,11 +174,28 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	var outboxInsert string = `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
-	_, err = tx.Exec(ctx, outboxInsert, uuid.New(), req.WorkflowID, shared_vars.BOOKING_WORKER, bookingOutboxBytes, bookingTimeout)
+	var insertWorkflowAndOutbox string = fmt.Sprintf(`
+		WITH inserted_workflow AS (
+			INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout)
+			VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '10 minutes', NOW() + INTERVAL '%d seconds')
+			RETURNING id
+		)
+		INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
+		SELECT $5, id, $6, $7, $8, NOW()
+		FROM inserted_workflow`, stateTimeoutSec)
+	_, err = tx.Exec(ctx, insertWorkflowAndOutbox,
+		req.WorkflowID,
+		req.WorkflowType,
+		shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING,
+		wfPayloadBytes,
+		uuid.New(),
+		shared_vars.BOOKING_WORKER,
+		bookingOutboxBytes,
+		bookingTimeout,
+	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to insert outbox",
+			"error": "Failed to insert workflow and outbox entry",
 		})
 		return
 	}

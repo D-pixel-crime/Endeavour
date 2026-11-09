@@ -39,10 +39,6 @@ func (msg *Message) GetUpdatedAt() time.Time {
 	return time.Now()
 }
 
-func (msg *Message) GetCreatedAt() time.Time {
-	return msg.GetUpdatedAt()
-}
-
 func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, maxMessages int32, waitTimeSeconds int32, visibilityTimeout int32) ([]*Message, error) {
 	if !strings.Contains(queueURL, ".fifo") {
 		return nil, fmt.Errorf(" queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
@@ -74,7 +70,14 @@ func ReceiveMessages(ctx context.Context, client *sqs.Client, queueURL string, m
 	for _, sqsMsg := range result.Messages {
 		var msg Message
 		if err := json.Unmarshal([]byte(*sqsMsg.Body), &msg); err != nil {
-			log.Printf("Error Unmarshalling Message %s: %v", *sqsMsg.MessageId, err)
+			log.Printf("[POISON PILL DETECTED] Error unmarshalling raw SQS message %s from %s: %v; deleting message to prevent FIFO HoL blocking", *sqsMsg.MessageId, queueURL, err)
+			_, delErr := client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+				QueueUrl:      aws.String(queueURL),
+				ReceiptHandle: sqsMsg.ReceiptHandle,
+			})
+			if delErr != nil {
+				log.Printf("Failed to delete corrupt SQS message %s: %v", *sqsMsg.MessageId, delErr)
+			}
 			continue
 		}
 

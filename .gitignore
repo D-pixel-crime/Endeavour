@@ -8,3 +8,6 @@
 **/*.env
 !**/example.env
 !**/example.*.env
+
+interview.md
+failure_scenarios.md

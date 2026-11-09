@@ -1,10 +1,11 @@
 ### WHAT ARE THE BEST TIMEOUTS TO KEEP ?
 - Cascading rule: DB Timeout < Worker Processing < SQS Visibility < Orchestrator State Timeout.
-- Database query timeout: 3–5 seconds.
-- Worker processing timeout: 10–15 seconds.
-- SQS visibility timeout: 30 seconds (with background heartbeat extension).
+- SQS visibility timeout: Provided per-queue via `.env` / queue creation, with dynamic upfront payload extension and background heartbeat extension (`VisibilityTimeout / 2`).
+- Worker processing timeout: Dynamically derived as `VisibilityTimeout / 2` (or overridden by payload `timeout_seconds`).
+- Database query timeout: Dynamically bounded to `WorkerTimeout / 3` (3–5 seconds).
 - CDC outbox retry window: 15–30 seconds (implemented: 30 seconds, instead of 2 minutes).
-- Orchestrator state timeout: 35–45 seconds (implemented: `taskTimeout + 20s`, accounting for Worker + CDC + SQS queue time + buffer).
+- Orchestrator state timeout: Dynamically derived as `VisibilityTimeout + TaskTimeout` (accounting for Worker + CDC + SQS queue time + buffer).
+- Sweeper retries: Dynamically calculated backoff `taskTimeout * (1 + 0.5 * retryCount)` with `stateTimeout = taskTimeout + (taskTimeout * 2)`.
 
 ---
 
@@ -13,7 +14,7 @@ Step-by-step failure scenarios study.
 
 ## Generating a UUID:
 - Suppose the UUID generation fails.
-  - **Resolved**: Replaced `uuid.New()` with `uuid.NewRandom()` in `orchestrator/handlers/get_handlers/generateWorkflowID.go`, returning an explicit HTTP 500 error if entropy fails rather than risking runtime panics.
+  - **Resolved**: Uses `uuid.NewV7()` in `orchestrator/handlers/get_handlers/generateWorkflowID.go`, returning an explicit HTTP 500 error if generation fails rather than risking runtime panics. Provides time-ordered, index-friendly unique identifiers.
 
 ## Creating a Workflow
 - Suppose client sends duplicate UUID.
@@ -58,9 +59,9 @@ Step-by-step failure scenarios study.
 
 ## Consumer.ReceiveMessages (same everywhere)
 - We read the messages, but run into some of the pre-processing errors.
-  - **Resolved**: Malformed JSON or missing workflow ID messages are logged as poison pills and acknowledged to prevent FIFO head-of-line blocking.
+  - **Resolved**: If a raw SQS message body fails deserialization, `ReceiveMessages` explicitly deletes the corrupt message via `client.DeleteMessage` and logs `[POISON PILL DETECTED]`, preventing infinite redelivery loops and FIFO head-of-line blocking.
 - What if a poison message fails in a FIFO queue? Head-of-Line (HoL) blocking stalls all subsequent messages in that `MessageGroupId` (workflow).
-  - **Resolved**: Unrecoverable/malformed payload errors are acknowledged or routed away from the queue so they do not block subsequent messages in the FIFO group.
+  - **Resolved**: Across all ingress and egress handlers, unrecoverable/malformed payload errors, missing workflow IDs, and non-existent database rows are detected as poison pills and acknowledged (`return true, nil`) to permanently clear the FIFO pipeline.
 - What if a message is retried after 5 minutes? AWS SQS FIFO deduplication window is only 5 minutes; it will be treated as a fresh message.
   - **Resolved**: Application-level idempotency via `SELECT workflow_state ... FOR UPDATE` and unique constraints (`uq_payments_workflow_id`, `uq_tickets_workflow_id`).
 - What if heartbeat visibility extension fails (throttled/network)? Message becomes visible to another worker, causing concurrent duplicate execution.
@@ -94,8 +95,8 @@ Step-by-step failure scenarios study.
   - **Resolved**: Isolated panic recovery and bounded batch processing.
 - What if we pull the messages and then the service crashes?
   - **Resolved**: SQS visibility timeout will expire, redelivering the message safely.
-- What if we pull a message which failed? Orchestrator currently deletes it without transitioning state or triggering compensation.
-  - **Resolved**: Orchestrator transitions workflow to `FAILED` and records failure payload.
+- What if we pull a message which failed? Orchestrator directly marks the whole workflow failed.
+  - **Resolved**: When `STATUS_FAILED` is received from Booking worker, Orchestrator re-emits a booking task to outbox with the same timeout as earlier (non-increasing) for up to 2 retries. Only if retries are exhausted does it mark the workflow as `FAILED`.
 - What if we pull a message whose workflow has gone past booking now?
   - **Resolved**: Ignored if not in `BOOKING` state (state regression prevention).
 - What if we receive a successful message, but that state has already timed-out?
@@ -130,8 +131,8 @@ Step-by-step failure scenarios study.
   - **Resolved**: Handled via batch panic recovery and bounded poller concurrency.
 - What if we pull the messages and then the service crashes?
   - **Resolved**: SQS visibility timeout will expire, redelivering the message safely.
-- What if we pull a message which failed? Orchestrator deletes it and never triggers compensation to release booked seats.
-  - **Resolved**: Orchestrator initiates backward compensation (`COMPENSATING_PAYMENT` -> `COMPENSATING_BOOKING` -> `FAILED`).
+- What if we pull a message which failed? Orchestrator initiates compensation immediately.
+  - **Resolved**: When `STATUS_FAILED` is received from Payment worker, Orchestrator re-emits a payment task to outbox with the same timeout as earlier (non-increasing) for up to 2 retries. Only if retries are exhausted does it initiate backward compensation (`COMPENSATING_PAYMENT` -> `COMPENSATING_BOOKING` -> `FAILED`).
 - What if we pull a message whose workflow has gone past payment now?
   - **Resolved**: Guarded by `wf.WorkflowState != ORCHESTRATOR_WORKFLOW_PAYMENT`.
 - What if we receive a successful message, but that state has already timed-out?
@@ -146,6 +147,11 @@ Step-by-step failure scenarios study.
 ## Compensating Transactions / Saga Rollbacks
 - What if Payment fails: who triggers the compensation to cancel the booking?
     - **Implemented**: If Payment fails (after 2 internal retries), it publishes `status = 'FAILED'` to outbox. CDC forwards it to Orchestrator Payment Egress. Orchestrator initiates backward compensation starting from Payment (`COMPENSATING_PAYMENT`), where Payment worker checks `payments` table (refunds if money was captured) and returns `status = 'COMPENSATED'`. Orchestrator then transitions to `COMPENSATING_BOOKING`, sends compensation to Booking to release seats, and once Booking confirms `COMPENSATED`, Orchestrator marks workflow `FAILED`.
+- What if a compensating action fails in a worker or orchestrator? How are backward retries handled?
+    - **Implemented**: Compensating actions apply the exact same reliability principles as forward actions:
+      1. **Worker Ingress Retries**: Both Booking and Payment workers retry compensation transactions up to 2 times internally with backoff. If retries exhaust, they emit `status = 'FAILED', action = 'COMPENSATE'` to outbox and acknowledge the message from SQS to avoid FIFO HOL blocking.
+      2. **Orchestrator In-Egress Retries**: If Orchestrator receives `STATUS_FAILED` while in `COMPENSATING_PAYMENT` or `COMPENSATING_BOOKING`, it retries the compensation up to 2 times with invariant timeouts.
+      3. **Compensation Failure Escalation**: If Payment compensation exhausts its 2 retries, Orchestrator immediately escalates to `COMPENSATING_BOOKING` to guarantee reserved seats are released, recording a `critical_operator_alert` for the failed refund. If Booking compensation exhausts its 2 retries, it marks `FAILED` with a `critical_operator_alert` for leaked inventory.
 - What if a compensation message fails to push to SQS or the worker crashes during compensation?
     - Outbox pattern and CDC ensure compensation messages are reliably delivered. SQS FIFO message redelivery with idempotent compensation handlers guarantees at-least-once execution.
 - What if compensation action (releasing seats) arrives out of order before the original booking committed?
@@ -163,9 +169,13 @@ Step-by-step failure scenarios study.
         - The cdc_service fails to read properly from the outbox.
 - What if there is no background sweeper/reaper daemon checking `state_timeout < NOW()`? Workflows never time out automatically in DB.
   - **Implemented**: Created dedicated standalone `sweeper_service` microservice (`sweeper_service/` package). It polls `workflows WHERE state_timeout IS NOT NULL AND state_timeout < NOW() FOR UPDATE SKIP LOCKED` on an independent interval:
-    - Automatically marks abandoned `BOOKING` workflows as `FAILED`.
-    - Automatically initiates backward compensation for abandoned `PAYMENT` workflows by updating state to `COMPENSATING_PAYMENT` and writing a compensation task to `outbox`.
-    - Handles multi-stage compensation timeouts (escalating from `COMPENSATING_PAYMENT` to `COMPENSATING_BOOKING` to guarantee booked seats are released).
+    - **Progressive Retries on Timeout**: Workflows timing out in any state (`BOOKING`, `PAYMENT`, `COMPENSATING_PAYMENT`, `COMPENSATING_BOOKING`) are retried up to 3 times with increasing state timeouts (35s -> 45s -> 55s), totaling up to a ~2-minute cumulative retry cap. `retry_count` is stored cleanly as an internal column on `workflows` (isolated from JSON payloads).
+    - **Worker Egress Confirmation on Redelivery**: If a worker already completed locally but its egress was delayed/lost in flight, re-dispatched retry tasks trigger the worker to re-emit its egress confirmation to outbox, satisfying the Orchestrator retry loop.
+    - **Compensation Escalation After Retries Exhausted**:
+      - If `BOOKING` exhausts all 3 retries: transitions to `FAILED`.
+      - If `PAYMENT` exhausts all 3 retries: initiates backward compensation (`COMPENSATING_PAYMENT`), resetting `retry_count = 0`.
+      - If `COMPENSATING_PAYMENT` exhausts all 3 retries: escalates directly to `COMPENSATING_BOOKING` (resetting `retry_count = 0`) to guarantee reserved seats are released.
+      - If `COMPENSATING_BOOKING` exhausts all 3 retries: marks `FAILED` and raises a critical operator alert payload.
     - Runs as a dedicated single-replica service, eliminating multi-instance lock contention, uncoordinated goroutine chaos, and unnecessary DB network calls from scaled Orchestrator API pods.
 - What if clock skew exists between Postgres server (`NOW()`) and Go app servers (`time.Now()`)?
   - **Resolved**: Query checks `WHERE state_timeout < NOW()` directly inside PostgreSQL engine, making Postgres server time the single source of truth and immune to app server clock skew.

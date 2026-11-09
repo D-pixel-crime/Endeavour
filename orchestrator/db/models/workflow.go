@@ -16,4 +16,5 @@ type Workflow struct {
 	CreatedAt     time.Time                         `db:"created_at" json:"created_at"`
 	ExpiresAt     *time.Time                        `db:"expires_at" json:"expires_at,omitempty"`
 	StateTimeout  *time.Time                        `db:"state_timeout" json:"state_timeout,omitempty"`
+	RetryCount    int                               `db:"retry_count" json:"-"`
 }

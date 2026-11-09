@@ -60,7 +60,18 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	taskTimeout := 15
+	visTimeout := 30
+	if visStr := os.Getenv("SWEEPER_VISIBILITY_TIMEOUT_SECONDS"); visStr != "" {
+		if v, err := strconv.Atoi(visStr); err == nil && v > 0 {
+			visTimeout = v
+		}
+	} else if visStr := os.Getenv("ORCHESTRATOR_VISIBILITY_TIMEOUT_SECONDS"); visStr != "" {
+		if v, err := strconv.Atoi(visStr); err == nil && v > 0 {
+			visTimeout = v
+		}
+	}
+
+	taskTimeout := visTimeout / 2
 	if timeoutStr := os.Getenv("SWEEPER_TASK_TIMEOUT_SECONDS"); timeoutStr != "" {
 		if t, err := strconv.Atoi(timeoutStr); err == nil && t > 0 {
 			taskTimeout = t

@@ -16,15 +16,6 @@ type cacheItem struct {
 // GlobalIdempotencyCache is the shared package instance used across handlers.
 var GlobalIdempotencyCache = NewIdempotencyCache(60*time.Second, 30*time.Second)
 
-// InitGlobalIdempotencyCache initializes the global idempotency cache with custom durations.
-func InitGlobalIdempotencyCache(ttl time.Duration, cleanupInterval time.Duration) *IdempotencyCache {
-	if GlobalIdempotencyCache != nil {
-		GlobalIdempotencyCache.Stop()
-	}
-	GlobalIdempotencyCache = NewIdempotencyCache(ttl, cleanupInterval)
-	return GlobalIdempotencyCache
-}
-
 // IdempotencyCache provides fast in-memory caching and in-flight deduplication
 // for workflow creation to protect the database from duplicate check floods.
 type IdempotencyCache struct {

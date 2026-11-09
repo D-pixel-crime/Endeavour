@@ -23,31 +23,6 @@ type BatchExtendResult struct {
 	Failed     []BatchExtendError
 }
 
-// ExtendMessageVisibility changes the visibility timeout of a single message by receipt handle.
-func ExtendMessageVisibility(ctx context.Context, client *sqs.Client, queueURL string, receiptHandle string, visibilityTimeout int32) error {
-	if client == nil || queueURL == "" || receiptHandle == "" {
-		return fmt.Errorf("client, queueURL, and receiptHandle cannot be empty")
-	}
-	if !strings.Contains(queueURL, ".fifo") {
-		return fmt.Errorf(" queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
-	}
-	if visibilityTimeout < 0 {
-		return fmt.Errorf("visibilityTimeout must be non-negative, got %d", visibilityTimeout)
-	}
-
-	input := &sqs.ChangeMessageVisibilityInput{
-		QueueUrl:          aws.String(queueURL),
-		ReceiptHandle:     aws.String(receiptHandle),
-		VisibilityTimeout: visibilityTimeout,
-	}
-
-	_, err := client.ChangeMessageVisibility(ctx, input)
-	if err != nil {
-		return fmt.Errorf("failed to change message visibility: %w", err)
-	}
-	return nil
-}
-
 // ExtendMessageBatchVisibility changes the visibility timeout for a batch of up to 10 messages.
 func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchExtendResult, error) {
 	if len(messages) == 0 {

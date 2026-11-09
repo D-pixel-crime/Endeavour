@@ -71,7 +71,7 @@ func main() {
 		}
 		shared_vars.BookingEgressVisibilityTimeout = int32(sec)
 
-		bookingTaskTimeout := sec
+		bookingTaskTimeout := sec / 2
 		if s := os.Getenv("BOOKING_TASK_TIMEOUT_SECONDS"); s != "" {
 			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
 				bookingTaskTimeout = parsed
@@ -109,7 +109,7 @@ func main() {
 		}
 		shared_vars.PaymentEgressVisibilityTimeout = int32(sec)
 
-		paymentTaskTimeout := sec
+		paymentTaskTimeout := sec / 2
 		if s := os.Getenv("PAYMENT_TASK_TIMEOUT_SECONDS"); s != "" {
 			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
 				paymentTaskTimeout = parsed

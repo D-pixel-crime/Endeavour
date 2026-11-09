@@ -27,24 +27,65 @@ type PaymentIngressPayload struct {
 	SeatIDs          []string         `json:"seat_ids"`
 	PaymentMethod    string           `json:"payment_method"`
 	CustomerDetails  *CustomerDetails `json:"customer_details,omitempty"`
-	UpdatedAt        string           `json:"updated_at,omitempty"`
-	CreatedAt        string           `json:"created_at,omitempty"`
 	TimeoutParameter int              `json:"timeout_parameter,omitempty"`
 	TimeoutSeconds   int              `json:"timeout_seconds,omitempty"`
 }
 
+func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, seatIDs []string, numSeats int, payloadBytes []byte, timeoutParam int) {
+	tx, err := shared.DBPool.Begin(ctx)
+	if err != nil {
+		log.Printf("Failed to begin transaction for recording payment failure: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	failOutbox := map[string]any{
+		"workflow_id":       workflowUUID.String(),
+		"status":            shared.STATUS_FAILED,
+		"reason":            reason,
+		"seat_ids":          seatIDs,
+		"num_seats":         numSeats,
+		"updated_at":        time.Now().UTC().Format(time.RFC3339),
+		"timeout_parameter": timeoutParam,
+		"timeout_seconds":   timeoutParam,
+	}
+	if action != "" {
+		failOutbox["action"] = action
+	}
+	failBytes, _ := json.Marshal(failOutbox)
+
+	const failQuery = `
+		WITH upserted_workflow AS (
+			INSERT INTO workflows (id, workflow_state, payload)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO UPDATE
+			  SET workflow_state = EXCLUDED.workflow_state,
+			      payload = EXCLUDED.payload
+		)
+		INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+		VALUES ($4, $1, 'PAYMENT', $5, NOW())`
+
+	if _, err := tx.Exec(ctx, failQuery, workflowUUID, string(shared.PAYMENT_WORKFLOW_FAILED), payloadBytes, uuid.New(), failBytes); err != nil {
+		log.Printf("Failed to execute payment failure query for workflow %s: %v", workflowUUID, err)
+		return
+	}
+	_ = tx.Commit(ctx)
+}
+
 func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
 	if msg == nil {
-		return false, fmt.Errorf("nil message received")
+		return true, nil
 	}
 
 	if msg.Payload == nil {
-		return false, fmt.Errorf("message payload is nil (id=%s)", msg.ID)
+		log.Printf("[POISON PILL DETECTED] Message payload is nil in payment message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
+		return true, nil
 	}
 
 	payloadBytes, err := json.Marshal(msg.Payload)
 	if err != nil {
-		return false, fmt.Errorf("failed to marshal message payload (id=%s): %w", msg.ID, err)
+		log.Printf("[POISON PILL DETECTED] Failed to marshal message payload for payment message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
+		return true, nil
 	}
 
 	var ingressPayload PaymentIngressPayload
@@ -69,14 +110,18 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		timeoutParam = ingressPayload.TimeoutSeconds
 	}
 	if timeoutParam <= 0 {
-		timeoutParam = 15
+		timeoutParam = int(shared.IngressVisibilityTimeout / 2)
+		if timeoutParam <= 0 {
+			timeoutParam = 15
+		}
 	}
 
-	// 1. Handle Compensation: Look into payments table to see whether money was taken
+	// 1. Handle Compensation
 	if ingressPayload.Action == shared.ACTION_COMPENSATE {
 		tx, err := shared.DBPool.Begin(ctx)
 		if err != nil {
-			return false, fmt.Errorf("failed to begin transaction: %w", err)
+			emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+			return true, nil
 		}
 		defer tx.Rollback(ctx)
 
@@ -92,7 +137,9 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 			if currentStatus == "COMPLETED" && amount > 0 {
 				_, err = tx.Exec(ctx, `UPDATE payments SET status = 'REFUNDED' WHERE workflow_id = $1`, workflowUUID)
 				if err != nil {
-					return false, fmt.Errorf("failed to refund payment for workflow %s: %w", workflowUUID, err)
+					tx.Rollback(ctx)
+					emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+					return true, nil
 				}
 				log.Printf("[PAYMENT COMPENSATION] Refunded amount %d for workflow %s", amount, workflowUUID)
 			} else {
@@ -100,18 +147,6 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 			}
 		} else {
 			log.Printf("[PAYMENT COMPENSATION] No payment record found for workflow %s; no money taken", workflowUUID)
-		}
-
-		_, err = tx.Exec(ctx,
-			`INSERT INTO workflows (id, workflow_state, payload)
-			 VALUES ($1, $2, $3)
-			 ON CONFLICT (id) DO UPDATE
-			   SET workflow_state = EXCLUDED.workflow_state,
-			       payload = EXCLUDED.payload`,
-			workflowUUID, string(shared.PAYMENT_WORKFLOW_FAILED), payloadBytes,
-		)
-		if err != nil {
-			return false, fmt.Errorf("failed to update workflow state during compensation: %w", err)
 		}
 
 		outboxPayload := map[string]any{
@@ -126,27 +161,41 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		}
 		outboxPayloadBytes, err := json.Marshal(outboxPayload)
 		if err != nil {
-			return false, fmt.Errorf("failed to marshal compensation outbox payload: %w", err)
+			tx.Rollback(ctx)
+			emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+			return true, nil
 		}
 
-		_, err = tx.Exec(ctx,
-			`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
-			 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
-			uuid.New(), workflowUUID, outboxPayloadBytes,
+		compensateQuery := `
+			WITH upserted_workflow AS (
+				INSERT INTO workflows (id, workflow_state, payload)
+				VALUES ($1, $2, $3)
+				ON CONFLICT (id) DO UPDATE
+				  SET workflow_state = EXCLUDED.workflow_state,
+				      payload = EXCLUDED.payload
+			)
+			INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+			VALUES ($4, $1, 'PAYMENT', $5, NOW())`
+		_, err = tx.Exec(ctx, compensateQuery,
+			workflowUUID, string(shared.PAYMENT_WORKFLOW_FAILED), payloadBytes,
+			uuid.New(), outboxPayloadBytes,
 		)
 		if err != nil {
-			return false, fmt.Errorf("failed to insert compensation outbox entry: %w", err)
+			tx.Rollback(ctx)
+			emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+			return true, nil
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return false, fmt.Errorf("failed to commit compensation transaction: %w", err)
+			emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+			return true, nil
 		}
 
 		log.Printf("[PAYMENT COMPENSATION] Successfully verified payments table for workflow %s and sent COMPENSATED outbox message", workflowUUID)
 		return true, nil
 	}
 
-	// 2. Normal Payment with 2 retries on failure
+	// 2. Normal Payment (No local retry loop: Orchestrator manages retries)
 	paymentMethod := ingressPayload.PaymentMethod
 	if paymentMethod == "" && ingressPayload.CustomerDetails != nil {
 		paymentMethod = ingressPayload.CustomerDetails.PaymentMethod
@@ -166,143 +215,132 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		}
 	}
 
-	const maxRetries = 2
-	var lastErr error
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*100) * time.Millisecond)
-		}
-
-		tx, err := shared.DBPool.Begin(ctx)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to begin transaction: %w", err)
-			continue
-		}
-
-		var existingState string
-		err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
-		if err == nil {
-			if existingState == string(shared.PAYMENT_WORKFLOW_COMPLETED) {
-				tx.Rollback(ctx)
-				log.Printf("Workflow %s payment is already COMPLETED; skipping duplicate processing", workflowUUID)
-				return true, nil
-			}
-			if existingState == string(shared.PAYMENT_WORKFLOW_FAILED) || existingState == string(shared.PAYMENT_WORKFLOW_COMPENSATING) {
-				tx.Rollback(ctx)
-				log.Printf("Workflow %s is in terminal/compensating state (%s); skipping duplicate execution to prevent state regression", workflowUUID, existingState)
-				return true, nil
-			}
-		}
-
-		_, err = tx.Exec(ctx,
-			`INSERT INTO workflows (id, workflow_state, payload)
-			 VALUES ($1, $2, $3)
-			 ON CONFLICT (id) DO UPDATE
-			   SET workflow_state = EXCLUDED.workflow_state,
-			       payload = EXCLUDED.payload`,
-			workflowUUID, string(shared.PAYMENT_WORKFLOW_COMPLETED), payloadBytes,
-		)
-		if err != nil {
-			tx.Rollback(ctx)
-			lastErr = fmt.Errorf("failed to upsert workflow: %w", err)
-			continue
-		}
-
-		// Deterministic payment_id derived from workflow UUID to ensure payment gateway idempotency across all retries
-		paymentID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("payment:"+workflowUUID.String()))
-		_, err = tx.Exec(ctx,
-			`INSERT INTO payments (id, workflow_id, amount, payment_method, status, created_at)
-			 VALUES ($1, $2, $3, $4, 'COMPLETED', NOW())
-			 ON CONFLICT (workflow_id) DO UPDATE
-			   SET amount = EXCLUDED.amount,
-			       payment_method = EXCLUDED.payment_method,
-			       status = EXCLUDED.status`,
-			paymentID, workflowUUID, amount, paymentMethod,
-		)
-		if err != nil {
-			tx.Rollback(ctx)
-			lastErr = fmt.Errorf("failed to insert payment record: %w", err)
-			continue
-		}
-
-		outboxPayload := map[string]any{
-			"workflow_id":       workflowUUID.String(),
-			"status":            shared.STATUS_COMPLETED,
-			"amount":            amount,
-			"payment_method":    paymentMethod,
-			"payment_id":        paymentID.String(),
-			"seat_ids":          ingressPayload.SeatIDs,
-			"num_seats":         ingressPayload.NumSeats,
-			"updated_at":        time.Now().UTC().Format(time.RFC3339),
-			"timeout_parameter": timeoutParam,
-			"timeout_seconds":   timeoutParam,
-		}
-		outboxPayloadBytes, err := json.Marshal(outboxPayload)
-		if err != nil {
-			tx.Rollback(ctx)
-			lastErr = fmt.Errorf("failed to marshal outbox payload: %w", err)
-			continue
-		}
-
-		outboxID := uuid.New()
-		_, err = tx.Exec(ctx,
-			`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
-			 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
-			outboxID, workflowUUID, outboxPayloadBytes,
-		)
-		if err != nil {
-			tx.Rollback(ctx)
-			lastErr = fmt.Errorf("failed to insert outbox entry: %w", err)
-			continue
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			lastErr = fmt.Errorf("failed to commit transaction: %w", err)
-			continue
-		}
-
-		log.Printf("Workflow %s payment processed: state=COMPLETED amount=%d; outbox message %s created",
-			workflowUUID, amount, outboxID)
-		return true, nil
-	}
-
-	// 3. Retries exhausted: Record FAILED in DB, emit FAILED outbox message, acknowledge from SQS
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to begin transaction for recording payment failure: %w", err)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to begin transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+		return true, nil
 	}
 	defer tx.Rollback(ctx)
 
-	_, _ = tx.Exec(ctx,
-		`INSERT INTO workflows (id, workflow_state, payload)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (id) DO UPDATE
-		   SET workflow_state = EXCLUDED.workflow_state,
-		       payload = EXCLUDED.payload`,
-		workflowUUID, string(shared.PAYMENT_WORKFLOW_FAILED), payloadBytes,
-	)
+	var existingState string
+	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
+	if err == nil {
+		if existingState == string(shared.PAYMENT_WORKFLOW_COMPLETED) {
+			var paymentID uuid.UUID
+			var currentAmount int
+			var pMethod string
+			_ = tx.QueryRow(ctx, `SELECT id, amount, payment_method FROM payments WHERE workflow_id = $1`, workflowUUID).Scan(&paymentID, &currentAmount, &pMethod)
+			outboxPayload := map[string]any{
+				"workflow_id":       workflowUUID.String(),
+				"status":            shared.STATUS_COMPLETED,
+				"amount":            currentAmount,
+				"payment_method":    pMethod,
+				"payment_id":        paymentID.String(),
+				"seat_ids":          ingressPayload.SeatIDs,
+				"num_seats":         ingressPayload.NumSeats,
+				"updated_at":        time.Now().UTC().Format(time.RFC3339),
+				"timeout_parameter": timeoutParam,
+				"timeout_seconds":   timeoutParam,
+			}
+			outboxPayloadBytes, _ := json.Marshal(outboxPayload)
+			_, _ = tx.Exec(ctx,
+				`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+				 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
+				uuid.New(), workflowUUID, outboxPayloadBytes,
+			)
+			if err := tx.Commit(ctx); err != nil {
+				return false, fmt.Errorf("failed to commit re-emitted payment egress outbox: %w", err)
+			}
+			log.Printf("Workflow %s payment is already COMPLETED; re-emitted egress outbox message to satisfy orchestrator retry", workflowUUID)
+			return true, nil
+		}
+		if existingState == string(shared.PAYMENT_WORKFLOW_FAILED) {
+			outboxPayload := map[string]any{
+				"workflow_id":       workflowUUID.String(),
+				"status":            shared.STATUS_FAILED,
+				"reason":            "Payment previously failed",
+				"updated_at":        time.Now().UTC().Format(time.RFC3339),
+				"timeout_parameter": timeoutParam,
+				"timeout_seconds":   timeoutParam,
+			}
+			outboxPayloadBytes, _ := json.Marshal(outboxPayload)
+			_, _ = tx.Exec(ctx,
+				`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+				 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
+				uuid.New(), workflowUUID, outboxPayloadBytes,
+			)
+			if err := tx.Commit(ctx); err != nil {
+				return false, fmt.Errorf("failed to commit re-emitted failed payment outbox: %w", err)
+			}
+			log.Printf("Workflow %s is already FAILED; re-emitted failure outbox message to satisfy orchestrator retry", workflowUUID)
+			return true, nil
+		}
+		if existingState == string(shared.PAYMENT_WORKFLOW_COMPENSATING) {
+			tx.Rollback(ctx)
+			log.Printf("Workflow %s is in compensating state; skipping forward execution", workflowUUID)
+			return true, nil
+		}
+	}
 
-	failOutbox := map[string]any{
+	// Deterministic payment_id derived from workflow UUID to ensure gateway idempotency
+	paymentID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("payment:"+workflowUUID.String()))
+
+	outboxPayload := map[string]any{
 		"workflow_id":       workflowUUID.String(),
-		"status":            shared.STATUS_FAILED,
-		"reason":            lastErr.Error(),
+		"status":            shared.STATUS_COMPLETED,
+		"amount":            amount,
+		"payment_method":    paymentMethod,
+		"payment_id":        paymentID.String(),
 		"seat_ids":          ingressPayload.SeatIDs,
 		"num_seats":         ingressPayload.NumSeats,
 		"updated_at":        time.Now().UTC().Format(time.RFC3339),
 		"timeout_parameter": timeoutParam,
 		"timeout_seconds":   timeoutParam,
 	}
-	failBytes, _ := json.Marshal(failOutbox)
+	outboxPayloadBytes, err := json.Marshal(outboxPayload)
+	if err != nil {
+		tx.Rollback(ctx)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to marshal outbox payload: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+		return true, nil
+	}
 
-	_, _ = tx.Exec(ctx,
-		`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
-		 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
-		uuid.New(), workflowUUID, failBytes,
+	outboxID := uuid.New()
+	completePaymentQuery := `
+		WITH upserted_workflow AS (
+			INSERT INTO workflows (id, workflow_state, payload)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO UPDATE
+			  SET workflow_state = EXCLUDED.workflow_state,
+			      payload = EXCLUDED.payload
+		),
+		upserted_payment AS (
+			INSERT INTO payments (id, workflow_id, amount, payment_method, status, created_at)
+			VALUES ($4, $1, $5, $6, 'COMPLETED', NOW())
+			ON CONFLICT (workflow_id) DO UPDATE
+			  SET amount = EXCLUDED.amount,
+			      payment_method = EXCLUDED.payment_method,
+			      status = CASE WHEN payments.status = 'REFUNDED' THEN 'REFUNDED' ELSE EXCLUDED.status END
+		)
+		INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+		VALUES ($7, $1, 'PAYMENT', $8, NOW())`
+	_, err = tx.Exec(ctx, completePaymentQuery,
+		workflowUUID, string(shared.PAYMENT_WORKFLOW_COMPLETED), payloadBytes,
+		paymentID, amount, paymentMethod,
+		outboxID, outboxPayloadBytes,
 	)
+	if err != nil {
+		tx.Rollback(ctx)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to record completed payment and outbox: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+		return true, nil
+	}
 
-	_ = tx.Commit(ctx)
-	log.Printf("Workflow %s payment failed after %d retries: %v; sent FAILED outbox message", workflowUUID, maxRetries, lastErr)
+	if err := tx.Commit(ctx); err != nil {
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to commit transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutParam)
+		return true, nil
+	}
+
+	log.Printf("Workflow %s payment processed: state=COMPLETED amount=%d; outbox message %s created",
+		workflowUUID, amount, outboxID)
 	return true, nil
 }
 

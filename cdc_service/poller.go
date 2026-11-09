@@ -45,36 +45,35 @@ func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, in
 
 func (p *Poller) checkTimeoutColumn(ctx context.Context) {
 	p.checkColOnce.Do(func() {
-		var exists bool
+		var existsTimeout, existsRetry bool
 		err := p.dbPool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM information_schema.columns 
-				WHERE table_name = 'outbox' AND column_name = 'timeout_seconds'
+			WITH timeout_check AS (
+				SELECT EXISTS (
+					SELECT 1 FROM information_schema.columns 
+					WHERE table_name = 'outbox' AND column_name = 'timeout_seconds'
+				) AS has_timeout
+			),
+			retry_check AS (
+				SELECT EXISTS (
+					SELECT 1 FROM information_schema.columns 
+					WHERE table_name = 'outbox' AND column_name = 'retry_count'
+				) AS has_retry
 			)
-		`).Scan(&exists)
+			SELECT has_timeout, has_retry FROM timeout_check CROSS JOIN retry_check
+		`).Scan(&existsTimeout, &existsRetry)
 		if err == nil {
-			p.hasTimeoutCol = exists
-			if exists {
+			p.hasTimeoutCol = existsTimeout
+			if existsTimeout {
 				log.Println("CDC Poller detected 'timeout_seconds' column in outbox table")
 			} else {
 				log.Println("CDC Poller: 'timeout_seconds' column not detected in outbox table, using fallback")
 			}
-		} else {
-			log.Printf("Warning: failed to check for timeout_seconds column in outbox: %v", err)
-		}
-
-		var existsRetry bool
-		err = p.dbPool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM information_schema.columns 
-				WHERE table_name = 'outbox' AND column_name = 'retry_count'
-			)
-		`).Scan(&existsRetry)
-		if err == nil {
 			p.hasRetryCol = existsRetry
 			if existsRetry {
 				log.Println("CDC Poller detected 'retry_count' column in outbox table")
 			}
+		} else {
+			log.Printf("Warning: failed to check columns in outbox: %v", err)
 		}
 	})
 }
