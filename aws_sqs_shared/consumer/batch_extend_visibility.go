@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -12,21 +13,24 @@ import (
 	"github.com/google/uuid"
 )
 
-type BatchExtendError struct {
+type BatchVisibilityError struct {
 	ID      string
 	Code    string
 	Message string
 }
 
-type BatchExtendResult struct {
+type BatchVisibilityResult struct {
 	Successful []string
-	Failed     []BatchExtendError
+	Failed     []BatchVisibilityError
 }
 
-// ExtendMessageBatchVisibility changes the visibility timeout for a batch of up to 10 messages.
-func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchExtendResult, error) {
+type BatchExtendError = BatchVisibilityError
+type BatchExtendResult = BatchVisibilityResult
+
+// ChangeMessageVisibilityBatch changes the visibility timeout for a batch of up to 10 messages.
+func ChangeMessageVisibilityBatch(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchVisibilityResult, error) {
 	if len(messages) == 0 {
-		return &BatchExtendResult{}, nil
+		return &BatchVisibilityResult{}, nil
 	}
 	if !strings.Contains(queueURL, ".fifo") {
 		return nil, fmt.Errorf(" queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
@@ -59,14 +63,21 @@ func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queue
 		Entries:  entries,
 	}
 
-	result, err := client.ChangeMessageVisibilityBatch(ctx, input)
+	reqCtx := ctx
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+
+	result, err := client.ChangeMessageVisibilityBatch(reqCtx, input)
 	if err != nil {
 		return nil, fmt.Errorf("error changing message visibility in batch: %w", err)
 	}
 
-	batchResult := &BatchExtendResult{
+	batchResult := &BatchVisibilityResult{
 		Successful: make([]string, len(result.Successful)),
-		Failed:     make([]BatchExtendError, len(result.Failed)),
+		Failed:     make([]BatchVisibilityError, len(result.Failed)),
 	}
 
 	for i, s := range result.Successful {
@@ -74,7 +85,7 @@ func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queue
 	}
 
 	for i, f := range result.Failed {
-		batchResult.Failed[i] = BatchExtendError{
+		batchResult.Failed[i] = BatchVisibilityError{
 			ID:      *f.Id,
 			Code:    *f.Code,
 			Message: *f.Message,
@@ -84,21 +95,21 @@ func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queue
 	return batchResult, nil
 }
 
-// ExtendAllBatchesVisibility divides messages into chunks of 10 and extends visibility for all.
-func ExtendAllBatchesVisibility(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchExtendResult, error) {
+// ChangeVisibilityAllBatches divides messages into chunks of 10 and changes visibility for all.
+func ChangeVisibilityAllBatches(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchVisibilityResult, error) {
 	if len(messages) == 0 || client == nil || queueURL == "" || visibilityTimeout < 0 {
-		return &BatchExtendResult{}, nil
+		return &BatchVisibilityResult{}, nil
 	}
 
-	aggregatedResult := &BatchExtendResult{}
+	aggregatedResult := &BatchVisibilityResult{}
 
 	for i := 0; i < len(messages); i += 10 {
 		end := min(i+10, len(messages))
 		chunk := messages[i:end]
 
-		result, err := ExtendMessageBatchVisibility(ctx, client, queueURL, chunk, visibilityTimeout)
+		result, err := ChangeMessageVisibilityBatch(ctx, client, queueURL, chunk, visibilityTimeout)
 		if err != nil {
-			log.Printf("Failed to extend SQS message visibility on %s: %v", queueURL, err)
+			log.Printf("Failed to change SQS message visibility on %s: %v", queueURL, err)
 			continue
 		}
 
@@ -106,9 +117,29 @@ func ExtendAllBatchesVisibility(ctx context.Context, client *sqs.Client, queueUR
 		aggregatedResult.Failed = append(aggregatedResult.Failed, result.Failed...)
 
 		for _, f := range result.Failed {
-			log.Printf("Failed to extend SQS message visibility (id=%s, code=%s) on %s: %s", f.ID, f.Code, queueURL, f.Message)
+			log.Printf("Failed to change SQS message visibility (id=%s, code=%s) on %s: %s", f.ID, f.Code, queueURL, f.Message)
 		}
 	}
 
 	return aggregatedResult, nil
+}
+
+// ChangeAllBatchesVisibility is an alias for ChangeVisibilityAllBatches.
+func ChangeAllBatchesVisibility(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchVisibilityResult, error) {
+	return ChangeVisibilityAllBatches(ctx, client, queueURL, messages, visibilityTimeout)
+}
+
+// ChangeMessageVisibilityAllBatches is an alias for ChangeVisibilityAllBatches.
+func ChangeMessageVisibilityAllBatches(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchVisibilityResult, error) {
+	return ChangeVisibilityAllBatches(ctx, client, queueURL, messages, visibilityTimeout)
+}
+
+// ExtendMessageBatchVisibility changes the visibility timeout for a batch of up to 10 messages.
+func ExtendMessageBatchVisibility(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchExtendResult, error) {
+	return ChangeMessageVisibilityBatch(ctx, client, queueURL, messages, visibilityTimeout)
+}
+
+// ExtendAllBatchesVisibility divides messages into chunks of 10 and extends visibility for all.
+func ExtendAllBatchesVisibility(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message, visibilityTimeout int32) (*BatchExtendResult, error) {
+	return ChangeVisibilityAllBatches(ctx, client, queueURL, messages, visibilityTimeout)
 }

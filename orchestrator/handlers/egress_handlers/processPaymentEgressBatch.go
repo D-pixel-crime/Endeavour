@@ -671,12 +671,14 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 func ProcessPaymentEgressBatch(ctx context.Context, messages []*consumer.Message) {
 	var toDelete []*consumer.Message
+	var toRelease []*consumer.Message
 
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
 
+		deleted := false
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -692,11 +694,20 @@ func ProcessPaymentEgressBatch(ctx context.Context, messages []*consumer.Message
 
 			if shouldDelete {
 				toDelete = append(toDelete, msg)
+				deleted = true
 			}
 		}()
+
+		if !deleted {
+			toRelease = append(toRelease, msg)
+		}
 	}
 
 	if len(toDelete) > 0 {
 		consumer.DeleteAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, toDelete)
+	}
+
+	if len(toRelease) > 0 {
+		consumer.ChangeVisibilityAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, toRelease, 0)
 	}
 }

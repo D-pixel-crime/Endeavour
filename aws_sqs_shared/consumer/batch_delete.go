@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -52,7 +53,14 @@ func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string
 		Entries:  entries,
 	}
 
-	result, err := client.DeleteMessageBatch(ctx, input)
+	reqCtx := ctx
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+
+	result, err := client.DeleteMessageBatch(reqCtx, input)
 	if err != nil {
 		return nil, fmt.Errorf("Error Deleting Messages in Batch: %w", err)
 	}
