@@ -14,10 +14,10 @@ import (
 
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
 	api_routes "github.com/D-pixel-crime/Endeavour/orchestrator/api_routes"
-	db "github.com/D-pixel-crime/Endeavour/orchestrator/db"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/middleware"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/poller"
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
+	"github.com/D-pixel-crime/Endeavour/utility"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -28,7 +28,7 @@ func main() {
 	}
 
 	var err error
-	shared_vars.Orchestrator_DB_Pool, err = db.ConnectToDb()
+	shared_vars.Orchestrator_DB_Pool, err = utility.ConnectToDBFromEnv(context.Background(), "ORCHESTRATOR_DB_URL")
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
@@ -150,6 +150,15 @@ func main() {
 
 	concurrencyLimiter := middleware.NewConcurrencyLimiter(maxConcurrentCreates)
 	defer middleware.GlobalIdempotencyCache.Stop()
+
+	shared_vars.PaymentServiceURL = strings.TrimRight(os.Getenv("PAYMENT_SERVICE_URL"), "/")
+	if shared_vars.PaymentServiceURL == "" {
+		paymentPort := os.Getenv("PAYMENT_PORT")
+		if paymentPort == "" {
+			paymentPort = "3001"
+		}
+		shared_vars.PaymentServiceURL = "http://localhost:" + strings.TrimPrefix(paymentPort, ":")
+	}
 
 	r := gin.Default()
 

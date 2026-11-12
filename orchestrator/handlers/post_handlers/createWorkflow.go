@@ -2,10 +2,10 @@ package posthandlers
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/D-pixel-crime/Endeavour/orchestrator/db"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/middleware"
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/gin-gonic/gin"
@@ -149,22 +149,13 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	visTimeout := int(shared_vars.BookingEgressVisibilityTimeout)
-	if visTimeout <= 0 {
-		visTimeout = 30
-	}
-	bookingTimeout := shared_vars.BookingTaskTimeoutSeconds
-	if bookingTimeout <= 0 {
-		bookingTimeout = visTimeout / 2
-	}
 	// Cascading rule: DB Timeout < Worker Processing (V/2) < SQS Visibility (V) < Orchestrator State Timeout (V + TaskTimeout)
-	stateTimeoutSec := visTimeout + bookingTimeout
+	bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
 
 	bookingOutboxPayload := map[string]any{
-		"workflow_id":       req.WorkflowID.String(),
-		"num_seats":         req.NumSeats,
-		"timeout_seconds":   bookingTimeout,
-		"timeout_parameter": bookingTimeout,
+		"workflow_id":     req.WorkflowID.String(),
+		"num_seats":       req.NumSeats,
+		"timeout_seconds": bookingTimeout,
 	}
 	bookingOutboxBytes, err := json.Marshal(bookingOutboxPayload)
 	if err != nil {
@@ -174,20 +165,21 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	var insertWorkflowAndOutbox string = fmt.Sprintf(`
+	const insertWorkflowAndOutbox = `
 		WITH inserted_workflow AS (
 			INSERT INTO workflows (id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout)
-			VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '10 minutes', NOW() + INTERVAL '%d seconds')
+			VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '10 minutes', NOW() + make_interval(secs => $5))
 			RETURNING id
 		)
 		INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
-		SELECT $5, id, $6, $7, $8, NOW()
-		FROM inserted_workflow`, stateTimeoutSec)
+		SELECT $6, id, $7, $8, $9, NOW()
+		FROM inserted_workflow`
 	_, err = tx.Exec(ctx, insertWorkflowAndOutbox,
 		req.WorkflowID,
 		req.WorkflowType,
 		shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING,
 		wfPayloadBytes,
+		stateTimeoutSec,
 		uuid.New(),
 		shared_vars.BOOKING_WORKER,
 		bookingOutboxBytes,

@@ -30,7 +30,7 @@ func (monitor *QueueMonitor) GetQueueStats(ctx context.Context, queueURL string)
 	input := &sqs.GetQueueAttributesInput{
 		QueueUrl: aws.String(queueURL),
 		AttributeNames: []types.QueueAttributeName{
-			types.QueueAttributeNameApproximateNumberOfMessagesDelayed,
+			types.QueueAttributeNameApproximateNumberOfMessages,
 			types.QueueAttributeNameApproximateNumberOfMessagesNotVisible,
 			types.QueueAttributeNameApproximateNumberOfMessagesDelayed,
 		},

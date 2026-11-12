@@ -16,6 +16,7 @@ var (
 
 	BookingTaskTimeoutSeconds int
 	PaymentTaskTimeoutSeconds int
+	PaymentServiceURL         string
 )
 
 type WorkerType string

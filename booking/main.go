@@ -13,9 +13,9 @@ import (
 	"time"
 
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
-	db_worker_booking "github.com/D-pixel-crime/Endeavour/booking/db"
 	"github.com/D-pixel-crime/Endeavour/booking/poller"
 	"github.com/D-pixel-crime/Endeavour/booking/shared"
+	"github.com/D-pixel-crime/Endeavour/utility"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -26,7 +26,7 @@ func main() {
 	}
 
 	var err error
-	shared.DBPool, err = db_worker_booking.ConnectToDb()
+	shared.DBPool, err = utility.ConnectToDBFromEnv(context.Background(), "BOOKING_DB_URL")
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}

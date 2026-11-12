@@ -11,7 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-type BatchHandler func(ctx context.Context, messages []*Message)
+// MessageHandler processes a single SQS message and returns shouldDelete=true if it should be acknowledged.
+type MessageHandler func(ctx context.Context, msg *Message) (shouldDelete bool, err error)
 
 type PollerConfig struct {
 	Name              string
@@ -26,10 +27,10 @@ type PollerConfig struct {
 
 type BatchPoller struct {
 	cfg     PollerConfig
-	handler BatchHandler
+	handler MessageHandler
 }
 
-func NewBatchPoller(cfg PollerConfig, handler BatchHandler) *BatchPoller {
+func NewBatchPoller(cfg PollerConfig, handler MessageHandler) *BatchPoller {
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 5
 	}
@@ -146,13 +147,16 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 	var toExtend []*Message
 	var maxRequiredVisibilitySec int32 = p.cfg.VisibilityTimeout
 
-	// Check completion time from updatedAt and processTimeout for each message
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
 
-		updatedAt := msg.GetUpdatedAt()
+		updatedAt := msg.UpdatedAt
+		if updatedAt.IsZero() {
+			updatedAt = receivedAt
+		}
+
 		procTimeout := p.cfg.ProcessTimeout
 		if msg.Payload != nil {
 			if ts, ok := msg.Payload["timeout_seconds"].(float64); ok && ts > 0 {
@@ -166,10 +170,7 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 			batchTimeout = procTimeout
 		}
 
-		// Calculate completion time from updatedAt and processTimeout
 		completionTime := updatedAt.Add(procTimeout)
-
-		// If completion time exceeds the visibilityPeriod, mark for visibility extension
 		if completionTime.After(currentDeadline) || receivedAt.Add(procTimeout).After(currentDeadline) {
 			toExtend = append(toExtend, msg)
 			neededSec := int32(math.Ceil(time.Until(completionTime).Seconds())) + 5
@@ -179,14 +180,13 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 		}
 	}
 
-	// Send API request to extend visibility if completion time exceeds visibilityPeriod
 	if len(toExtend) > 0 {
 		if maxRequiredVisibilitySec > 43200 { // AWS SQS maximum visibility timeout is 12 hours
 			maxRequiredVisibilitySec = 43200
 		}
 		log.Printf("[%s Poller] Completion time from updatedAt and processTimeout exceeds visibilityPeriod (%v); extending visibility to %ds for %d message(s)",
 			p.cfg.Name, visibilityTimeout, maxRequiredVisibilitySec, len(toExtend))
-		if _, err := ExtendAllBatchesVisibility(ctx, p.cfg.Client, p.cfg.QueueURL, toExtend, maxRequiredVisibilitySec); err != nil {
+		if _, err := ChangeVisibilityAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, toExtend, maxRequiredVisibilitySec); err != nil {
 			log.Printf("[%s Poller] Failed to extend visibility: %v", p.cfg.Name, err)
 		}
 	}
@@ -212,10 +212,53 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 			case <-ticker.C:
 				log.Printf("[%s Poller] Processing still in-flight, extending visibility by %ds for %d message(s)",
 					p.cfg.Name, p.cfg.VisibilityTimeout, len(messages))
-				_, _ = ExtendAllBatchesVisibility(ctx, p.cfg.Client, p.cfg.QueueURL, messages, p.cfg.VisibilityTimeout)
+				_, _ = ChangeVisibilityAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, messages, p.cfg.VisibilityTimeout)
 			}
 		}
 	}()
 
-	p.handler(processCtx, messages)
+	p.processMessageBatch(processCtx, messages)
+}
+
+func (p *BatchPoller) processMessageBatch(ctx context.Context, messages []*Message) {
+	var toDelete []*Message
+	var toRelease []*Message
+
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+
+		deleted := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[%s Poller] Recovered from panic processing message %s: %v", p.cfg.Name, msg.ID, r)
+				}
+			}()
+
+			shouldDelete, err := p.handler(ctx, msg)
+			if err != nil {
+				log.Printf("[%s Poller] Error processing message %s: %v", p.cfg.Name, msg.ID, err)
+				return
+			}
+
+			if shouldDelete {
+				toDelete = append(toDelete, msg)
+				deleted = true
+			}
+		}()
+
+		if !deleted {
+			toRelease = append(toRelease, msg)
+		}
+	}
+
+	if len(toDelete) > 0 {
+		DeleteAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, toDelete)
+	}
+
+	if len(toRelease) > 0 {
+		ChangeVisibilityAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, toRelease, 0)
+	}
 }

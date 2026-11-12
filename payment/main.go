@@ -13,9 +13,10 @@ import (
 	"time"
 
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
-	db_worker_payment "github.com/D-pixel-crime/Endeavour/payment/db"
+	"github.com/D-pixel-crime/Endeavour/payment/handlers"
 	"github.com/D-pixel-crime/Endeavour/payment/poller"
 	"github.com/D-pixel-crime/Endeavour/payment/shared"
+	"github.com/D-pixel-crime/Endeavour/utility"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -26,7 +27,7 @@ func main() {
 	}
 
 	var err error
-	shared.DBPool, err = db_worker_payment.ConnectToDb()
+	shared.DBPool, err = utility.ConnectToDBFromEnv(context.Background(), "PAYMENT_DB_URL")
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
@@ -72,6 +73,8 @@ func main() {
 	}
 
 	r := gin.Default()
+	r.GET("/payment/:workflow_id", handlers.GetPaymentByWorkflowID)
+	r.GET("/payments/:workflow_id", handlers.GetPaymentByWorkflowID)
 
 	port := os.Getenv("PAYMENT_PORT")
 	if port == "" {

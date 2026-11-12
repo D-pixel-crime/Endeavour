@@ -9,24 +9,14 @@ import (
 	"github.com/D-pixel-crime/Endeavour/payment/shared"
 )
 
-const defaultMaxConcurrentPulls = 5
-
-func resolveMaxConcurrency(maxConcurrency []int) int {
-	if len(maxConcurrency) > 0 && maxConcurrency[0] > 0 {
-		return maxConcurrency[0]
-	}
-	return defaultMaxConcurrentPulls
-}
-
-func StartPoller(ctx context.Context, interval time.Duration, maxConcurrency ...int) {
-	limit := resolveMaxConcurrency(maxConcurrency)
+func StartPoller(ctx context.Context, interval time.Duration, maxConcurrency int) {
 	bp := consumer.NewBatchPoller(consumer.PollerConfig{
 		Name:              "Payment Ingress",
 		Client:            shared.IngressSQSClient,
 		QueueURL:          shared.IngressQueueURL,
 		Interval:          interval,
-		MaxConcurrency:    limit,
+		MaxConcurrency:    maxConcurrency,
 		VisibilityTimeout: shared.IngressVisibilityTimeout,
-	}, handlers.ProcessIngressBatch)
+	}, handlers.ProcessPaymentIngressMessage)
 	bp.Start(ctx)
 }

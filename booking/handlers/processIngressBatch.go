@@ -10,18 +10,27 @@ import (
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/consumer"
 	"github.com/D-pixel-crime/Endeavour/booking/shared"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type BookingIngressPayload struct {
-	WorkflowID       uuid.UUID `json:"workflow_id"`
-	NumSeats         int       `json:"num_seats"`
-	Action           string    `json:"action,omitempty"`
-	SeatIDs          []string  `json:"seat_ids,omitempty"`
-	TimeoutParameter int       `json:"timeout_parameter,omitempty"`
-	TimeoutSeconds   int       `json:"timeout_seconds,omitempty"`
+	WorkflowID     uuid.UUID `json:"workflow_id"`
+	NumSeats       int       `json:"num_seats"`
+	Action         string    `json:"action,omitempty"`
+	TimeoutSeconds int       `json:"timeout_seconds,omitempty"`
 }
 
-func emitBookingFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, payloadBytes []byte, timeoutParam int) {
+func resolveBookingTimeout(ingress BookingIngressPayload) int {
+	if ingress.TimeoutSeconds > 0 {
+		return ingress.TimeoutSeconds
+	}
+	if t := int(shared.IngressVisibilityTimeout / 2); t > 0 {
+		return t
+	}
+	return 15
+}
+
+func emitBookingFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, payloadBytes []byte, timeoutSec int) {
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
 		log.Printf("Failed to begin transaction for recording booking failure: %v", err)
@@ -30,12 +39,11 @@ func emitBookingFailure(ctx context.Context, workflowUUID uuid.UUID, action stri
 	defer tx.Rollback(ctx)
 
 	failOutbox := map[string]any{
-		"workflow_id":       workflowUUID.String(),
-		"status":            shared.STATUS_FAILED,
-		"reason":            reason,
-		"updated_at":        time.Now().UTC().Format(time.RFC3339),
-		"timeout_parameter": timeoutParam,
-		"timeout_seconds":   timeoutParam,
+		"workflow_id":     workflowUUID.String(),
+		"status":          shared.STATUS_FAILED,
+		"reason":          reason,
+		"updated_at":      time.Now().UTC().Format(time.RFC3339),
+		"timeout_seconds": timeoutSec,
 	}
 	if action != "" {
 		failOutbox["action"] = action
@@ -60,116 +68,104 @@ func emitBookingFailure(ctx context.Context, workflowUUID uuid.UUID, action stri
 	_ = tx.Commit(ctx)
 }
 
-func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
-	if msg == nil {
-		return true, nil
+func reemitBookingOutbox(ctx context.Context, tx pgx.Tx, workflowUUID uuid.UUID, payload map[string]any, label string) (bool, error) {
+	outboxBytes, _ := json.Marshal(payload)
+	_, _ = tx.Exec(ctx,
+		`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+		 VALUES ($1, $2, 'BOOKING', $3, NOW())`,
+		uuid.New(), workflowUUID, outboxBytes,
+	)
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("failed to commit re-emitted %s booking outbox: %w", label, err)
 	}
+	log.Printf("Workflow %s is already %s; re-emitted egress outbox message to satisfy orchestrator retry", workflowUUID, label)
+	return true, nil
+}
 
-	if msg.Payload == nil {
-		log.Printf("[POISON PILL DETECTED] Message payload is nil in booking message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
-		return true, nil
-	}
-
-	payloadBytes, err := json.Marshal(msg.Payload)
+func handleBookingCompensation(ctx context.Context, workflowUUID uuid.UUID, payloadBytes []byte, timeoutSec int) (bool, error) {
+	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		log.Printf("[POISON PILL DETECTED] Failed to marshal message payload for booking message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
+		emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutSec)
+		return true, nil
+	}
+	defer tx.Rollback(ctx)
+
+	outboxPayload := map[string]any{
+		"workflow_id":     workflowUUID.String(),
+		"status":          shared.STATUS_COMPENSATED,
+		"action":          shared.ACTION_COMPENSATE,
+		"updated_at":      time.Now().UTC().Format(time.RFC3339),
+		"timeout_seconds": timeoutSec,
+	}
+	outboxPayloadBytes, err := json.Marshal(outboxPayload)
+	if err != nil {
+		emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
-	var ingressPayload BookingIngressPayload
-	if err := json.Unmarshal(payloadBytes, &ingressPayload); err != nil {
-		log.Printf("[POISON PILL DETECTED] Unmarshal failed for booking message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
+	const compensateQuery = `
+		WITH released_seats AS (
+			UPDATE seat SET is_booked = false, booked_by_workflow_id = NULL
+			WHERE booked_by_workflow_id = $1
+		),
+		upserted_workflow AS (
+			INSERT INTO workflows (id, workflow_state, payload)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO UPDATE
+			  SET workflow_state = EXCLUDED.workflow_state,
+			      payload = EXCLUDED.payload
+		)
+		INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
+		VALUES ($4, $1, 'BOOKING', $5, NOW())`
+	_, err = tx.Exec(ctx, compensateQuery,
+		workflowUUID, string(shared.BOOKING_WORKFLOW_FAILED), payloadBytes,
+		uuid.New(), outboxPayloadBytes,
+	)
+	if err != nil {
+		tx.Rollback(ctx)
+		emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
-	if ingressPayload.WorkflowID == uuid.Nil {
-		log.Printf("[POISON PILL DETECTED] Missing or invalid workflow ID in booking message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
+	if err := tx.Commit(ctx); err != nil {
+		emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
-	workflowUUID := ingressPayload.WorkflowID
+	log.Printf("[BOOKING COMPENSATION] Released seats for workflow %s and sent COMPENSATED to outbox", workflowUUID)
+	return true, nil
+}
+
+func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
+	ingressPayload, payloadBytes, ok := consumer.DecodePayload[BookingIngressPayload](
+		msg, "booking", func(p *BookingIngressPayload) uuid.UUID { return p.WorkflowID },
+	)
+	if !ok {
+		return true, nil
+	}
 
 	if shared.DBPool == nil {
 		return false, fmt.Errorf("database pool is not initialized")
 	}
 
-	timeoutParam := ingressPayload.TimeoutParameter
-	if timeoutParam <= 0 {
-		timeoutParam = ingressPayload.TimeoutSeconds
-	}
-	if timeoutParam <= 0 {
-		timeoutParam = int(shared.IngressVisibilityTimeout / 2)
-		if timeoutParam <= 0 {
-			timeoutParam = 15
-		}
-	}
+	workflowUUID := ingressPayload.WorkflowID
+	timeoutSec := resolveBookingTimeout(ingressPayload)
 
 	// 1. Handle Compensation
 	if ingressPayload.Action == shared.ACTION_COMPENSATE {
-		tx, err := shared.DBPool.Begin(ctx)
-		if err != nil {
-			emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutParam)
-			return true, nil
-		}
-		defer tx.Rollback(ctx)
-
-		outboxPayload := map[string]any{
-			"workflow_id":       workflowUUID.String(),
-			"status":            shared.STATUS_COMPENSATED,
-			"action":            shared.ACTION_COMPENSATE,
-			"updated_at":        time.Now().UTC().Format(time.RFC3339),
-			"timeout_parameter": timeoutParam,
-			"timeout_seconds":   timeoutParam,
-		}
-		outboxPayloadBytes, err := json.Marshal(outboxPayload)
-		if err != nil {
-			emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutParam)
-			return true, nil
-		}
-
-		compensateQuery := `
-			WITH released_seats AS (
-				UPDATE seat SET is_booked = false, booked_by_workflow_id = NULL
-				WHERE booked_by_workflow_id = $1
-			),
-			upserted_workflow AS (
-				INSERT INTO workflows (id, workflow_state, payload)
-				VALUES ($1, $2, $3)
-				ON CONFLICT (id) DO UPDATE
-				  SET workflow_state = EXCLUDED.workflow_state,
-				      payload = EXCLUDED.payload
-			)
-			INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
-			VALUES ($4, $1, 'BOOKING', $5, NOW())`
-		_, err = tx.Exec(ctx, compensateQuery,
-			workflowUUID, string(shared.BOOKING_WORKFLOW_FAILED), payloadBytes,
-			uuid.New(), outboxPayloadBytes,
-		)
-		if err != nil {
-			tx.Rollback(ctx)
-			emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutParam)
-			return true, nil
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			emitBookingFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), payloadBytes, timeoutParam)
-			return true, nil
-		}
-
-		log.Printf("[BOOKING COMPENSATION] Released seats for workflow %s and sent COMPENSATED to outbox", workflowUUID)
-		return true, nil
+		return handleBookingCompensation(ctx, workflowUUID, payloadBytes, timeoutSec)
 	}
 
 	// 2. Normal Booking (No local retry loop: Orchestrator manages retries)
 	if ingressPayload.NumSeats <= 0 {
 		log.Printf("[POISON PILL DETECTED] Missing or invalid num_seats (%d) in booking message %s for workflow %s; recording failure", ingressPayload.NumSeats, msg.ID, workflowUUID)
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("Invalid num_seats: %d", ingressPayload.NumSeats), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("Invalid num_seats: %d", ingressPayload.NumSeats), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to begin transaction: %v", err), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to begin transaction: %v", err), payloadBytes, timeoutSec)
 		return true, nil
 	}
 	defer tx.Rollback(ctx)
@@ -177,7 +173,8 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	var existingState string
 	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
 	if err == nil {
-		if existingState == string(shared.BOOKING_WORKFLOW_COMPLETED) {
+		switch existingState {
+		case string(shared.BOOKING_WORKFLOW_COMPLETED):
 			var seatIDStrings []string
 			seatRows, sErr := tx.Query(ctx, `SELECT id FROM seat WHERE booked_by_workflow_id = $1`, workflowUUID)
 			if sErr == nil {
@@ -189,49 +186,25 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 				}
 				seatRows.Close()
 			}
-			outboxPayload := map[string]any{
-				"workflow_id":       workflowUUID.String(),
-				"status":            shared.STATUS_COMPLETED,
-				"seat_ids":          seatIDStrings,
-				"num_seats":         len(seatIDStrings),
-				"updated_at":        time.Now().UTC().Format(time.RFC3339),
-				"timeout_parameter": timeoutParam,
-				"timeout_seconds":   timeoutParam,
-			}
-			outboxPayloadBytes, _ := json.Marshal(outboxPayload)
-			_, _ = tx.Exec(ctx,
-				`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
-				 VALUES ($1, $2, 'BOOKING', $3, NOW())`,
-				uuid.New(), workflowUUID, outboxPayloadBytes,
-			)
-			if err := tx.Commit(ctx); err != nil {
-				return false, fmt.Errorf("failed to commit re-emitted booking egress outbox: %w", err)
-			}
-			log.Printf("Workflow %s is already COMPLETED; re-emitted egress outbox message to satisfy orchestrator retry", workflowUUID)
-			return true, nil
-		}
-		if existingState == string(shared.BOOKING_WORKFLOW_FAILED) {
-			outboxPayload := map[string]any{
-				"workflow_id":       workflowUUID.String(),
-				"status":            shared.STATUS_FAILED,
-				"reason":            "Booking previously failed",
-				"updated_at":        time.Now().UTC().Format(time.RFC3339),
-				"timeout_parameter": timeoutParam,
-				"timeout_seconds":   timeoutParam,
-			}
-			outboxPayloadBytes, _ := json.Marshal(outboxPayload)
-			_, _ = tx.Exec(ctx,
-				`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
-				 VALUES ($1, $2, 'BOOKING', $3, NOW())`,
-				uuid.New(), workflowUUID, outboxPayloadBytes,
-			)
-			if err := tx.Commit(ctx); err != nil {
-				return false, fmt.Errorf("failed to commit re-emitted failed booking outbox: %w", err)
-			}
-			log.Printf("Workflow %s is already FAILED; re-emitted failure outbox message to satisfy orchestrator retry", workflowUUID)
-			return true, nil
-		}
-		if existingState == string(shared.BOOKING_WORKFLOW_COMPENSATING) {
+			return reemitBookingOutbox(ctx, tx, workflowUUID, map[string]any{
+				"workflow_id":     workflowUUID.String(),
+				"status":          shared.STATUS_COMPLETED,
+				"seat_ids":        seatIDStrings,
+				"num_seats":       len(seatIDStrings),
+				"updated_at":      time.Now().UTC().Format(time.RFC3339),
+				"timeout_seconds": timeoutSec,
+			}, "COMPLETED")
+
+		case string(shared.BOOKING_WORKFLOW_FAILED):
+			return reemitBookingOutbox(ctx, tx, workflowUUID, map[string]any{
+				"workflow_id":     workflowUUID.String(),
+				"status":          shared.STATUS_FAILED,
+				"reason":          "Booking previously failed",
+				"updated_at":      time.Now().UTC().Format(time.RFC3339),
+				"timeout_seconds": timeoutSec,
+			}, "FAILED")
+
+		case string(shared.BOOKING_WORKFLOW_COMPENSATING):
 			tx.Rollback(ctx)
 			log.Printf("Workflow %s is in compensating state; skipping forward execution", workflowUUID)
 			return true, nil
@@ -248,7 +221,7 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to query available seats: %v", err), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to query available seats: %v", err), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
@@ -258,7 +231,7 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 		if err := rows.Scan(&seatID); err != nil {
 			rows.Close()
 			tx.Rollback(ctx)
-			emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to scan seat id: %v", err), payloadBytes, timeoutParam)
+			emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to scan seat id: %v", err), payloadBytes, timeoutSec)
 			return true, nil
 		}
 		seatIDs = append(seatIDs, seatID)
@@ -267,7 +240,7 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 
 	if len(seatIDs) < ingressPayload.NumSeats {
 		tx.Rollback(ctx)
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("insufficient seats: requested %d, available %d", ingressPayload.NumSeats, len(seatIDs)), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("insufficient seats: requested %d, available %d", ingressPayload.NumSeats, len(seatIDs)), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
@@ -277,23 +250,22 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 
 	outboxPayload := map[string]any{
-		"workflow_id":       workflowUUID.String(),
-		"status":            shared.STATUS_COMPLETED,
-		"seat_ids":          seatIDStrings,
-		"num_seats":         ingressPayload.NumSeats,
-		"updated_at":        time.Now().UTC().Format(time.RFC3339),
-		"timeout_parameter": timeoutParam,
-		"timeout_seconds":   timeoutParam,
+		"workflow_id":     workflowUUID.String(),
+		"status":          shared.STATUS_COMPLETED,
+		"seat_ids":        seatIDStrings,
+		"num_seats":       ingressPayload.NumSeats,
+		"updated_at":      time.Now().UTC().Format(time.RFC3339),
+		"timeout_seconds": timeoutSec,
 	}
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to marshal outbox payload: %v", err), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to marshal outbox payload: %v", err), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
 	outboxID := uuid.New()
-	completeBookingQuery := `
+	const completeBookingQuery = `
 		WITH updated_seats AS (
 			UPDATE seat SET is_booked = true, booked_by_workflow_id = $1 WHERE id = ANY($2::uuid[])
 		),
@@ -316,59 +288,16 @@ func ProcessBookingIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to complete booking and insert outbox: %v", err), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to complete booking and insert outbox: %v", err), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to commit transaction: %v", err), payloadBytes, timeoutParam)
+		emitBookingFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to commit transaction: %v", err), payloadBytes, timeoutSec)
 		return true, nil
 	}
 
 	log.Printf("Workflow %s processed: state=COMPLETED seats_booked=%d; outbox message %s created",
 		workflowUUID, len(seatIDs), outboxID)
 	return true, nil
-}
-
-func ProcessIngressBatch(ctx context.Context, messages []*consumer.Message) {
-	var toDelete []*consumer.Message
-	var toRelease []*consumer.Message
-
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-
-		deleted := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("Recovered from panic processing booking message %s: %v", msg.ID, r)
-				}
-			}()
-
-			shouldDelete, err := ProcessBookingIngressMessage(ctx, msg)
-			if err != nil {
-				log.Printf("Error processing message %s: %v", msg.ID, err)
-				return
-			}
-
-			if shouldDelete {
-				toDelete = append(toDelete, msg)
-				deleted = true
-			}
-		}()
-
-		if !deleted {
-			toRelease = append(toRelease, msg)
-		}
-	}
-
-	if len(toDelete) > 0 {
-		consumer.DeleteAllBatches(ctx, shared.IngressSQSClient, shared.IngressQueueURL, toDelete)
-	}
-
-	if len(toRelease) > 0 {
-		consumer.ChangeVisibilityAllBatches(ctx, shared.IngressSQSClient, shared.IngressQueueURL, toRelease, 0)
-	}
 }

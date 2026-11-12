@@ -3,112 +3,56 @@ package consumer
 import (
 	"context"
 	"fmt"
-	"log"
-	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
-	"github.com/google/uuid"
 )
 
-type BatchDeleteError struct {
-	ID      string
-	Code    string
-	Message string
-}
-
-type BatchDeleteResult struct {
-	Successful []string
-	Failed     []BatchDeleteError
-}
-
-func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message) (*BatchDeleteResult, error) {
+// DeleteMessageBatch deletes up to 10 SQS messages from a FIFO queue in one batch call.
+func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message) (*BatchResult, error) {
 	if len(messages) == 0 {
-		return &BatchDeleteResult{}, nil
+		return &BatchResult{}, nil
 	}
-	if !strings.Contains(queueURL, ".fifo") {
-		return nil, fmt.Errorf(" queue %s must be a FIFO queue (name must end with .fifo)", queueURL)
-	}
-
-	if len(messages) > 10 {
-		return nil, fmt.Errorf("Error! Batch Size exceeds maximum allowed of 10 messages.")
+	if err := validateFIFOBatch(client, queueURL, messages); err != nil {
+		return nil, err
 	}
 
 	entries := make([]types.DeleteMessageBatchRequestEntry, len(messages))
 	for i, msg := range messages {
-		entryID := msg.ID.String()
-		if msg.ID == uuid.Nil {
-			entryID = fmt.Sprintf("msg-%d", i)
-		}
 		entries[i] = types.DeleteMessageBatchRequestEntry{
-			Id:            aws.String(entryID),
+			Id:            aws.String(batchEntryID(msg, i)),
 			ReceiptHandle: aws.String(msg.ReceiptHandle),
 		}
 	}
 
-	input := &sqs.DeleteMessageBatchInput{
+	reqCtx, cancel := batchRequestContext(ctx)
+	defer cancel()
+
+	result, err := client.DeleteMessageBatch(reqCtx, &sqs.DeleteMessageBatchInput{
 		QueueUrl: aws.String(queueURL),
 		Entries:  entries,
-	}
-
-	reqCtx := ctx
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		reqCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-	}
-
-	result, err := client.DeleteMessageBatch(reqCtx, input)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("Error Deleting Messages in Batch: %w", err)
+		return nil, fmt.Errorf("error deleting messages in batch: %w", err)
 	}
 
-	batchResult := &BatchDeleteResult{
+	batchResult := &BatchResult{
 		Successful: make([]string, len(result.Successful)),
-		Failed:     make([]BatchDeleteError, len(result.Failed)),
+		Failed:     mapBatchErrors(result.Failed),
 	}
-
 	for i, s := range result.Successful {
 		batchResult.Successful[i] = *s.Id
 	}
-
-	for i, f := range result.Failed {
-		batchResult.Failed[i] = BatchDeleteError{
-			ID:      *f.Id,
-			Code:    *f.Code,
-			Message: *f.Message,
-		}
-	}
-
 	return batchResult, nil
 }
 
-func DeleteAllBatches(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message) (*BatchDeleteResult, error) {
+// DeleteAllBatches divides messages into chunks of 10 and deletes all from the queue.
+func DeleteAllBatches(ctx context.Context, client *sqs.Client, queueURL string, messages []*Message) (*BatchResult, error) {
 	if len(messages) == 0 || client == nil || queueURL == "" {
-		return &BatchDeleteResult{}, nil
+		return &BatchResult{}, nil
 	}
-
-	aggregatedResult := &BatchDeleteResult{}
-
-	for i := 0; i < len(messages); i += 10 {
-		end := min(i+10, len(messages))
-		chunk := messages[i:end]
-
-		result, err := DeleteMessageBatch(ctx, client, queueURL, chunk)
-		if err != nil {
-			log.Printf("Failed to batch delete SQS messages from %s: %v", queueURL, err)
-			continue
-		}
-
-		aggregatedResult.Successful = append(aggregatedResult.Successful, result.Successful...)
-		aggregatedResult.Failed = append(aggregatedResult.Failed, result.Failed...)
-
-		for _, f := range result.Failed {
-			log.Printf("Failed to delete SQS message (id=%s, code=%s) from %s: %s", f.ID, f.Code, queueURL, f.Message)
-		}
-	}
-
-	return aggregatedResult, nil
+	return runAllBatches(messages, queueURL, "batch delete SQS message", func(chunk []*Message) (*BatchResult, error) {
+		return DeleteMessageBatch(ctx, client, queueURL, chunk)
+	})
 }

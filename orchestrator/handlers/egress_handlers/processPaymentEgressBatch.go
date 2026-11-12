@@ -2,13 +2,11 @@ package egresshandlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/consumer"
-	"github.com/D-pixel-crime/Endeavour/orchestrator/db/models"
+	"github.com/D-pixel-crime/Endeavour/orchestrator/db"
 	shared_vars "github.com/D-pixel-crime/Endeavour/orchestrator/shared"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -25,38 +23,26 @@ type PaymentEgressPayload struct {
 	Reason        string    `json:"reason,omitempty"`
 }
 
+func resolveEgressSeatIDs(egressPayload PaymentEgressPayload, currentPayload map[string]any) []string {
+	if len(egressPayload.SeatIDs) > 0 {
+		return egressPayload.SeatIDs
+	}
+	return db.ExtractSeatIDs(currentPayload)
+}
+
 func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
-	if msg == nil {
+	egressPayload, _, ok := consumer.DecodePayload[PaymentEgressPayload](
+		msg, "payment egress", func(p *PaymentEgressPayload) uuid.UUID { return p.WorkflowID },
+	)
+	if !ok {
 		return true, nil
 	}
-
-	if msg.Payload == nil {
-		log.Printf("[POISON PILL DETECTED] Message payload is nil for payment egress message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
-		return true, nil
-	}
-
-	payloadBytes, err := json.Marshal(msg.Payload)
-	if err != nil {
-		log.Printf("[POISON PILL DETECTED] Failed to marshal payload for payment egress message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
-		return true, nil
-	}
-
-	var egressPayload PaymentEgressPayload
-	if err := json.Unmarshal(payloadBytes, &egressPayload); err != nil {
-		log.Printf("[POISON PILL DETECTED] Unmarshal failed for payment egress message %s: %v; acknowledging to prevent FIFO HoL blocking", msg.ID, err)
-		return true, nil
-	}
-
-	if egressPayload.WorkflowID == uuid.Nil {
-		log.Printf("[POISON PILL DETECTED] Missing or invalid workflow ID in payment egress message %s; acknowledging to prevent FIFO HoL blocking", msg.ID)
-		return true, nil
-	}
-
-	workflowUUID := egressPayload.WorkflowID
 
 	if shared_vars.Orchestrator_DB_Pool == nil {
 		return false, fmt.Errorf("database pool is not initialized")
 	}
+
+	workflowUUID := egressPayload.WorkflowID
 
 	tx, err := shared_vars.Orchestrator_DB_Pool.Begin(ctx)
 	if err != nil {
@@ -64,18 +50,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 	defer tx.Rollback(ctx)
 
-	var wf models.Workflow
-	queryWorkflow := `SELECT id, workflow_type, workflow_state, payload, created_at, expires_at, state_timeout, retry_count FROM workflows WHERE id = $1 FOR UPDATE`
-	err = tx.QueryRow(ctx, queryWorkflow, workflowUUID).Scan(
-		&wf.ID,
-		&wf.WorkflowType,
-		&wf.WorkflowState,
-		&wf.Payload,
-		&wf.CreatedAt,
-		&wf.ExpiresAt,
-		&wf.StateTimeout,
-		&wf.RetryCount,
-	)
+	wf, err := db.GetWorkflowByID(ctx, tx, workflowUUID, true)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			log.Printf("[POISON PILL DETECTED] Workflow %s not found in workflows table; acknowledging message %s to prevent FIFO HoL blocking", workflowUUID, msg.ID)
@@ -84,84 +59,44 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return false, fmt.Errorf("failed to query workflow %s: %w", workflowUUID, err)
 	}
 
-	var currentPayload map[string]any
-	if len(wf.Payload) > 0 {
-		if err := json.Unmarshal(wf.Payload, &currentPayload); err != nil {
-			log.Printf("Warning: failed to unmarshal existing workflow payload for %s: %v", workflowUUID, err)
-			currentPayload = make(map[string]any)
-		}
-	}
-	if currentPayload == nil {
-		currentPayload = make(map[string]any)
-	}
+	currentPayload := db.UnmarshalWorkflowPayload(wf.Payload)
 
 	// 1. Payment Failed -> Check retries before going to backward compensation
 	if egressPayload.Status == shared_vars.STATUS_FAILED {
+		const maxRetries = 2
+		timeoutSec, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.PaymentEgressVisibilityTimeout, shared_vars.PaymentTaskTimeoutSeconds)
+
 		// A. Handling Failure during Backward Compensation (COMPENSATING_PAYMENT)
 		if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT {
-			visTimeout := int(shared_vars.PaymentEgressVisibilityTimeout)
-			if visTimeout <= 0 {
-				visTimeout = 30
-			}
-			timeoutSec := shared_vars.PaymentTaskTimeoutSeconds
-			if timeoutSec <= 0 {
-				timeoutSec = visTimeout / 2
-			}
-			stateTimeoutSec := visTimeout + timeoutSec
-
-			const maxRetries = 2
-
-			// If retries not exhausted (< 2), re-emit payment compensation with the same timeout
 			if wf.RetryCount < maxRetries {
 				newRetryCount := wf.RetryCount + 1
 				currentPayload["last_payment_compensation_failure"] = map[string]any{
 					"status":    egressPayload.Status,
 					"reason":    egressPayload.Reason,
-					"failed_at": time.Now().UTC().Format(time.RFC3339),
+					"failed_at": db.NewOutboxTimestamp(),
 					"attempt":   newRetryCount,
 				}
-				updatedPayloadBytes, err := json.Marshal(currentPayload)
-				if err != nil {
-					return false, fmt.Errorf("failed to marshal retry payload for %s: %w", workflowUUID, err)
-				}
 
-				compensatePaymentPayload := map[string]any{
-					"workflow_id":       workflowUUID.String(),
-					"action":            shared_vars.ACTION_COMPENSATE,
-					"reason":            fmt.Sprintf("Payment compensation retry (attempt %d/%d): %s", newRetryCount, maxRetries, egressPayload.Reason),
-					"updated_at":        time.Now().UTC().Format(time.RFC3339),
-					"timeout_seconds":   timeoutSec,
-					"timeout_parameter": timeoutSec,
-					"retry_count":       newRetryCount,
-				}
-				compensateBytes, _ := json.Marshal(compensatePaymentPayload)
-
-				outboxID := uuid.New()
-				retryQuery := fmt.Sprintf(`
-					WITH updated_workflow AS (
-						UPDATE workflows 
-						SET payload = $1, 
-						    state_timeout = NOW() + INTERVAL '%d seconds', 
-						    retry_count = retry_count + 1 
-						WHERE id = $2
-						RETURNING id
-					)
-					INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
-					SELECT $3, id, $4, $5, $6, NOW()
-					FROM updated_workflow`, stateTimeoutSec)
-
-				_, err = tx.Exec(ctx, retryQuery,
-					updatedPayloadBytes,
-					workflowUUID,
-					outboxID,
-					shared_vars.PAYMENT_WORKER,
-					compensateBytes,
-					timeoutSec,
-				)
+				_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
+					WorkflowID:      workflowUUID,
+					NextState:       wf.WorkflowState,
+					WorkflowPayload: currentPayload,
+					StateTimeoutSec: stateTimeoutSec,
+					RetryCount:      newRetryCount,
+					WorkerType:      shared_vars.PAYMENT_WORKER,
+					OutboxPayload: map[string]any{
+						"workflow_id":     workflowUUID.String(),
+						"action":          shared_vars.ACTION_COMPENSATE,
+						"reason":          fmt.Sprintf("Payment compensation retry (attempt %d/%d): %s", newRetryCount, maxRetries, egressPayload.Reason),
+						"updated_at":      db.NewOutboxTimestamp(),
+						"timeout_seconds": timeoutSec,
+						"retry_count":     newRetryCount,
+					},
+					TaskTimeoutSec: timeoutSec,
+				})
 				if err != nil {
 					return false, fmt.Errorf("failed to retry payment compensation for workflow %s: %w", workflowUUID, err)
 				}
-
 				if err := tx.Commit(ctx); err != nil {
 					return false, fmt.Errorf("failed to commit retry transaction for workflow %s: %w", workflowUUID, err)
 				}
@@ -173,78 +108,37 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 			// Payment compensation retries exhausted (>= 2):
 			// Escalate directly to COMPENSATING_BOOKING to release reserved seats, and record a critical operator alert!
-			seatIDs := egressPayload.SeatIDs
-			if len(seatIDs) == 0 {
-				if rawSeats, ok := currentPayload["seat_ids"].([]any); ok {
-					for _, s := range rawSeats {
-						if str, ok := s.(string); ok {
-							seatIDs = append(seatIDs, str)
-						}
-					}
-				}
-			}
-
-			visBookingTimeout := int(shared_vars.BookingEgressVisibilityTimeout)
-			if visBookingTimeout <= 0 {
-				visBookingTimeout = 30
-			}
-			bookingTimeout := shared_vars.BookingTaskTimeoutSeconds
-			if bookingTimeout <= 0 {
-				bookingTimeout = visBookingTimeout / 2
-			}
-			bookingStateTimeoutSec := visBookingTimeout + bookingTimeout
+			seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
+			bookingTimeout, bookingStateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
 
 			currentPayload["payment_compensation_failure"] = map[string]any{
 				"status":            egressPayload.Status,
 				"reason":            egressPayload.Reason,
-				"failed_at":         time.Now().UTC().Format(time.RFC3339),
+				"failed_at":         db.NewOutboxTimestamp(),
 				"exhausted_retries": wf.RetryCount,
 			}
 			currentPayload["critical_operator_alert"] = fmt.Sprintf("Payment compensation failed after %d retries (%s); escalated to Booking seat release. Customer refund requires manual operator review.", wf.RetryCount, egressPayload.Reason)
 
-			updatedPayloadBytes, err := json.Marshal(currentPayload)
-			if err != nil {
-				return false, fmt.Errorf("failed to marshal escalated payload for %s: %w", workflowUUID, err)
-			}
-
-			compensateBookingPayload := map[string]any{
-				"workflow_id":       workflowUUID.String(),
-				"action":            shared_vars.ACTION_COMPENSATE,
-				"seat_ids":          seatIDs,
-				"reason":            fmt.Sprintf("Payment compensation failed after %d retries; escalating to release seats", wf.RetryCount),
-				"updated_at":        time.Now().UTC().Format(time.RFC3339),
-				"timeout_seconds":   bookingTimeout,
-				"timeout_parameter": bookingTimeout,
-			}
-			compensateBookingBytes, _ := json.Marshal(compensateBookingPayload)
-
-			escalateQuery := fmt.Sprintf(`
-				WITH updated_workflow AS (
-					UPDATE workflows 
-					SET workflow_state = $1, 
-					    payload = $2, 
-					    state_timeout = NOW() + INTERVAL '%d seconds', 
-					    retry_count = 0 
-					WHERE id = $3
-					RETURNING id
-				)
-				INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
-				SELECT $4, id, $5, $6, $7, NOW()
-				FROM updated_workflow`, bookingStateTimeoutSec)
-
-			_, err = tx.Exec(ctx, escalateQuery,
-				shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
-				updatedPayloadBytes,
-				workflowUUID,
-				uuid.New(),
-				shared_vars.BOOKING_WORKER,
-				compensateBookingBytes,
-				bookingTimeout,
-			)
+			_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
+				WorkflowID:      workflowUUID,
+				NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
+				WorkflowPayload: currentPayload,
+				StateTimeoutSec: bookingStateTimeoutSec,
+				RetryCount:      0,
+				WorkerType:      shared_vars.BOOKING_WORKER,
+				OutboxPayload: map[string]any{
+					"workflow_id":     workflowUUID.String(),
+					"action":          shared_vars.ACTION_COMPENSATE,
+					"seat_ids":        seatIDs,
+					"reason":          fmt.Sprintf("Payment compensation failed after %d retries; escalating to release seats", wf.RetryCount),
+					"updated_at":      db.NewOutboxTimestamp(),
+					"timeout_seconds": bookingTimeout,
+				},
+				TaskTimeoutSec: bookingTimeout,
+			})
 			if err != nil {
 				return false, fmt.Errorf("failed to escalate to booking compensation for %s: %w", workflowUUID, err)
 			}
-
 			if err := tx.Commit(ctx); err != nil {
 				return false, fmt.Errorf("failed to commit escalation transaction for %s: %w", workflowUUID, err)
 			}
@@ -254,50 +148,21 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		}
 
 		// B. Handling Failure during Forward Step (PAYMENT)
-		// Idempotency Guard: Only initiate retry or compensation if the workflow is currently expecting payment.
-		// If it has already transitioned to COMPENSATING_PAYMENT, COMPENSATING_BOOKING, or FAILED,
-		// skip re-dispatching to prevent duplicate compensation storms or state regression.
 		if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT {
 			log.Printf("Workflow %s payment failed message received, but workflow state is %s (expected PAYMENT or COMPENSATING_PAYMENT); skipping duplicate failure transition", workflowUUID, wf.WorkflowState)
 			return true, nil
 		}
 
-		visTimeout := int(shared_vars.PaymentEgressVisibilityTimeout)
-		if visTimeout <= 0 {
-			visTimeout = 30
-		}
-		timeoutSec := shared_vars.PaymentTaskTimeoutSeconds
-		if timeoutSec <= 0 {
-			timeoutSec = visTimeout / 2
-		}
-		stateTimeoutSec := visTimeout + timeoutSec
-
-		const maxRetries = 2
-
-		// If retries not exhausted (< 2), re-emit work for PAYMENT worker with the same timeout as earlier
 		if wf.RetryCount < maxRetries {
 			newRetryCount := wf.RetryCount + 1
 			currentPayload["last_payment_failure"] = map[string]any{
 				"status":    egressPayload.Status,
 				"reason":    egressPayload.Reason,
-				"failed_at": time.Now().UTC().Format(time.RFC3339),
+				"failed_at": db.NewOutboxTimestamp(),
 				"attempt":   newRetryCount,
 			}
-			updatedPayloadBytes, err := json.Marshal(currentPayload)
-			if err != nil {
-				return false, fmt.Errorf("failed to marshal retry payload for %s: %w", workflowUUID, err)
-			}
 
-			seatIDs := egressPayload.SeatIDs
-			if len(seatIDs) == 0 {
-				if rawSeats, ok := currentPayload["seat_ids"].([]any); ok {
-					for _, s := range rawSeats {
-						if str, ok := s.(string); ok {
-							seatIDs = append(seatIDs, str)
-						}
-					}
-				}
-			}
+			seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
 
 			numSeats := egressPayload.NumSeats
 			if numSeats <= 0 {
@@ -318,55 +183,31 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			}
 
 			paymentRetryPayload := map[string]any{
-				"workflow_id":       workflowUUID.String(),
-				"seat_ids":          seatIDs,
-				"num_seats":         numSeats,
-				"amount":            amount,
-				"updated_at":        time.Now().UTC().Format(time.RFC3339),
-				"timeout_seconds":   timeoutSec,
-				"timeout_parameter": timeoutSec,
-				"retry_count":       newRetryCount,
+				"workflow_id":     workflowUUID.String(),
+				"seat_ids":        seatIDs,
+				"num_seats":       numSeats,
+				"amount":          amount,
+				"updated_at":      db.NewOutboxTimestamp(),
+				"timeout_seconds": timeoutSec,
+				"retry_count":     newRetryCount,
 			}
-
-			if pm, ok := currentPayload["payment_method"].(string); ok && pm != "" {
+			if pm := db.ExtractPaymentMethod(currentPayload); pm != "" {
 				paymentRetryPayload["payment_method"] = pm
-			} else if cd, ok := currentPayload["customer_details"].(map[string]any); ok {
-				if pm, ok := cd["payment_method"].(string); ok && pm != "" {
-					paymentRetryPayload["payment_method"] = pm
-				}
 			}
 
-			paymentRetryBytes, err := json.Marshal(paymentRetryPayload)
-			if err != nil {
-				return false, fmt.Errorf("failed to marshal payment retry outbox payload for %s: %w", workflowUUID, err)
-			}
-
-			outboxID := uuid.New()
-			retryQuery := fmt.Sprintf(`
-				WITH updated_workflow AS (
-					UPDATE workflows 
-					SET payload = $1, 
-					    state_timeout = NOW() + INTERVAL '%d seconds', 
-					    retry_count = retry_count + 1 
-					WHERE id = $2
-					RETURNING id
-				)
-				INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
-				SELECT $3, id, $4, $5, $6, NOW()
-				FROM updated_workflow`, stateTimeoutSec)
-
-			_, err = tx.Exec(ctx, retryQuery,
-				updatedPayloadBytes,
-				workflowUUID,
-				outboxID,
-				shared_vars.PAYMENT_WORKER,
-				paymentRetryBytes,
-				timeoutSec,
-			)
+			_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
+				WorkflowID:      workflowUUID,
+				NextState:       wf.WorkflowState,
+				WorkflowPayload: currentPayload,
+				StateTimeoutSec: stateTimeoutSec,
+				RetryCount:      newRetryCount,
+				WorkerType:      shared_vars.PAYMENT_WORKER,
+				OutboxPayload:   paymentRetryPayload,
+				TaskTimeoutSec:  timeoutSec,
+			})
 			if err != nil {
 				return false, fmt.Errorf("failed to retry payment for workflow %s: %w", workflowUUID, err)
 			}
-
 			if err := tx.Commit(ctx); err != nil {
 				return false, fmt.Errorf("failed to commit retry transaction for workflow %s: %w", workflowUUID, err)
 			}
@@ -380,45 +221,29 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		currentPayload["payment_failure"] = map[string]any{
 			"status":            egressPayload.Status,
 			"reason":            egressPayload.Reason,
-			"failed_at":         time.Now().UTC().Format(time.RFC3339),
+			"failed_at":         db.NewOutboxTimestamp(),
 			"exhausted_retries": wf.RetryCount,
 		}
-		updatedPayloadBytes, err := json.Marshal(currentPayload)
-		if err != nil {
-			return false, fmt.Errorf("failed to marshal payload for %s: %w", workflowUUID, err)
-		}
 
-		compensatePaymentPayload := map[string]any{
-			"workflow_id":       workflowUUID.String(),
-			"action":            shared_vars.ACTION_COMPENSATE,
-			"reason":            egressPayload.Reason,
-			"updated_at":        time.Now().UTC().Format(time.RFC3339),
-			"timeout_seconds":   timeoutSec,
-			"timeout_parameter": timeoutSec,
-		}
-		compensateBytes, _ := json.Marshal(compensatePaymentPayload)
-
-		query := fmt.Sprintf(`
-			WITH updated_workflow AS (
-				UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds', retry_count = 0 WHERE id = $3
-				RETURNING id
-			)
-			INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
-			SELECT $4, id, $5, $6, $7, NOW()
-			FROM updated_workflow`, stateTimeoutSec)
-		_, err = tx.Exec(ctx, query,
-			shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT,
-			updatedPayloadBytes,
-			workflowUUID,
-			uuid.New(),
-			shared_vars.PAYMENT_WORKER,
-			compensateBytes,
-			timeoutSec,
-		)
+		_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
+			WorkflowID:      workflowUUID,
+			NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT,
+			WorkflowPayload: currentPayload,
+			StateTimeoutSec: stateTimeoutSec,
+			RetryCount:      0,
+			WorkerType:      shared_vars.PAYMENT_WORKER,
+			OutboxPayload: map[string]any{
+				"workflow_id":     workflowUUID.String(),
+				"action":          shared_vars.ACTION_COMPENSATE,
+				"reason":          egressPayload.Reason,
+				"updated_at":      db.NewOutboxTimestamp(),
+				"timeout_seconds": timeoutSec,
+			},
+			TaskTimeoutSec: timeoutSec,
+		})
 		if err != nil {
 			return false, fmt.Errorf("failed to update workflow %s and insert payment compensation outbox: %w", workflowUUID, err)
 		}
-
 		if err := tx.Commit(ctx); err != nil {
 			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
 		}
@@ -429,73 +254,37 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	// 2. Payment Compensated -> Move backward to previous service: BOOKING
 	if egressPayload.Status == shared_vars.STATUS_COMPENSATED {
-		// Idempotency Guard: Only advance to COMPENSATING_BOOKING if currently in COMPENSATING_PAYMENT (or PAYMENT).
-		// If already in COMPENSATING_BOOKING or terminal FAILED, skip to prevent state regression and duplicate outbox events.
 		if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT && wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT {
 			log.Printf("Workflow %s payment compensated message received, but workflow state is %s (expected COMPENSATING_PAYMENT); skipping duplicate transition", workflowUUID, wf.WorkflowState)
 			return true, nil
 		}
 		currentPayload["payment_compensation"] = map[string]any{
 			"status":         egressPayload.Status,
-			"compensated_at": time.Now().UTC().Format(time.RFC3339),
-		}
-		updatedPayloadBytes, err := json.Marshal(currentPayload)
-		if err != nil {
-			return false, fmt.Errorf("failed to marshal payload for %s: %w", workflowUUID, err)
+			"compensated_at": db.NewOutboxTimestamp(),
 		}
 
-		visTimeout := int(shared_vars.BookingEgressVisibilityTimeout)
-		if visTimeout <= 0 {
-			visTimeout = 30
-		}
-		timeoutSec := shared_vars.BookingTaskTimeoutSeconds
-		if timeoutSec <= 0 {
-			timeoutSec = visTimeout / 2
-		}
-		stateTimeoutSec := visTimeout + timeoutSec
+		bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
+		seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
 
-		seatIDs := egressPayload.SeatIDs
-		if len(seatIDs) == 0 {
-			if rawSeats, ok := currentPayload["seat_ids"].([]any); ok {
-				for _, s := range rawSeats {
-					if str, ok := s.(string); ok {
-						seatIDs = append(seatIDs, str)
-					}
-				}
-			}
-		}
-
-		compensateBookingPayload := map[string]any{
-			"workflow_id":       workflowUUID.String(),
-			"action":            shared_vars.ACTION_COMPENSATE,
-			"seat_ids":          seatIDs,
-			"updated_at":        time.Now().UTC().Format(time.RFC3339),
-			"timeout_seconds":   timeoutSec,
-			"timeout_parameter": timeoutSec,
-		}
-		compensateBookingBytes, _ := json.Marshal(compensateBookingPayload)
-
-		query := fmt.Sprintf(`
-			WITH updated_workflow AS (
-				UPDATE workflows SET workflow_state = $1, payload = $2, state_timeout = NOW() + INTERVAL '%d seconds', retry_count = 0 WHERE id = $3
-				RETURNING id
-			)
-			INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at)
-			SELECT $4, id, $5, $6, $7, NOW()
-			FROM updated_workflow`, stateTimeoutSec)
-		_, err = tx.Exec(ctx, query,
-			shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
-			updatedPayloadBytes,
-			workflowUUID,
-			uuid.New(),
-			shared_vars.BOOKING_WORKER,
-			compensateBookingBytes,
-			timeoutSec,
-		)
+		_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
+			WorkflowID:      workflowUUID,
+			NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
+			WorkflowPayload: currentPayload,
+			StateTimeoutSec: stateTimeoutSec,
+			RetryCount:      0,
+			WorkerType:      shared_vars.BOOKING_WORKER,
+			OutboxPayload: map[string]any{
+				"workflow_id":     workflowUUID.String(),
+				"action":          shared_vars.ACTION_COMPENSATE,
+				"seat_ids":        seatIDs,
+				"updated_at":      db.NewOutboxTimestamp(),
+				"timeout_seconds": bookingTimeout,
+			},
+			TaskTimeoutSec: bookingTimeout,
+		})
 		if err != nil {
 			return false, fmt.Errorf("failed to update workflow %s and insert booking compensation outbox: %w", workflowUUID, err)
 		}
-
 		if err := tx.Commit(ctx); err != nil {
 			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
 		}
@@ -510,24 +299,48 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 		return true, nil
 	}
 
+	paymentInfo := db.PaymentInfo{
+		PaymentID:     egressPayload.PaymentID,
+		Amount:        egressPayload.Amount,
+		PaymentMethod: egressPayload.PaymentMethod,
+		Status:        egressPayload.Status,
+		SeatIDs:       egressPayload.SeatIDs,
+		NumSeats:      egressPayload.NumSeats,
+	}
+
+	if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED {
+		existingTicket, err := db.GetTicketByWorkflowID(ctx, tx, workflowUUID)
+		if err == nil {
+			log.Printf("Workflow %s is already COMPLETED with ticket %s; skipping duplicate payment egress message", workflowUUID, existingTicket.ID)
+			return true, nil
+		}
+		if err != pgx.ErrNoRows {
+			return false, fmt.Errorf("failed to verify existing ticket for completed workflow %s: %w", workflowUUID, err)
+		}
+
+		t, err := db.GenerateAndStoreTicket(ctx, tx, wf, currentPayload, paymentInfo)
+		if err != nil {
+			return false, fmt.Errorf("failed to backfill missing ticket for completed workflow %s: %w", workflowUUID, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
+		}
+		log.Printf("Workflow %s was already COMPLETED without a ticket; created ticket %s", workflowUUID, t.ID)
+		return true, nil
+	}
+
 	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT {
 		log.Printf("Workflow %s is in state %s (expected PAYMENT); skipping ticket creation", workflowUUID, wf.WorkflowState)
 
-		// Ghost charge prevention: If payment was captured in Payment DB but workflow is no longer in PAYMENT state
-		// (e.g. timed out to FAILED or escalated to COMPENSATING_BOOKING), refund the charge immediately by emitting
-		// a compensation outbox event.
+		// Ghost charge prevention: Refund charge if payment completed after workflow timed out/escalated.
 		if egressPayload.Amount > 0 || egressPayload.PaymentID != "" {
-			compensatePaymentPayload := map[string]any{
-				"workflow_id":       workflowUUID.String(),
-				"action":            shared_vars.ACTION_COMPENSATE,
-				"reason":            fmt.Sprintf("Ghost charge refund: completed after workflow state was %s", wf.WorkflowState),
-				"updated_at":        time.Now().UTC().Format(time.RFC3339),
-				"timeout_seconds":   15,
-				"timeout_parameter": 15,
-			}
-			compensatePaymentBytes, _ := json.Marshal(compensatePaymentPayload)
-			outboxInsert := `INSERT INTO outbox (id, workflow_id, worker_type, payload, timeout_seconds, updated_at) VALUES ($1, $2, $3, $4, $5, NOW())`
-			_, err = tx.Exec(ctx, outboxInsert, uuid.New(), workflowUUID, shared_vars.PAYMENT_WORKER, compensatePaymentBytes, 15)
+			_, err := db.InsertOutbox(ctx, tx, workflowUUID, shared_vars.PAYMENT_WORKER, map[string]any{
+				"workflow_id":     workflowUUID.String(),
+				"action":          shared_vars.ACTION_COMPENSATE,
+				"reason":          fmt.Sprintf("Ghost charge refund: completed after workflow state was %s", wf.WorkflowState),
+				"updated_at":      db.NewOutboxTimestamp(),
+				"timeout_seconds": 15,
+			}, 15)
 			if err != nil {
 				return false, fmt.Errorf("failed to insert ghost charge refund compensation outbox for %s: %w", workflowUUID, err)
 			}
@@ -535,179 +348,18 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 				return false, fmt.Errorf("failed to commit ghost charge refund compensation for %s: %w", workflowUUID, err)
 			}
 			log.Printf("[GHOST CHARGE RESOLVED] Dispatched compensation to refund payment for workflow %s (current state: %s)", workflowUUID, wf.WorkflowState)
-			return true, nil
 		}
-
 		return true, nil
 	}
 
-	var customerName, customerEmail string
-	if fn, ok := currentPayload["full_name"].(string); ok {
-		customerName = fn
-	}
-	if em, ok := currentPayload["email"].(string); ok {
-		customerEmail = em
-	}
-	if customerName == "" || customerEmail == "" {
-		if cd, ok := currentPayload["customer_details"].(map[string]any); ok {
-			if customerName == "" {
-				if fn, ok := cd["full_name"].(string); ok {
-					customerName = fn
-				}
-			}
-			if customerEmail == "" {
-				if em, ok := cd["email"].(string); ok {
-					customerEmail = em
-				}
-			}
-		}
-	}
-
-	seatIDs := egressPayload.SeatIDs
-	if len(seatIDs) == 0 {
-		if rawSeats, ok := currentPayload["seat_ids"].([]any); ok {
-			for _, s := range rawSeats {
-				if str, ok := s.(string); ok {
-					seatIDs = append(seatIDs, str)
-				}
-			}
-		}
-	}
-	if len(seatIDs) == 0 {
-		numSeats := egressPayload.NumSeats
-		if numSeats <= 0 {
-			if ns, ok := currentPayload["num_seats"].(float64); ok && ns > 0 {
-				numSeats = int(ns)
-			}
-		}
-		if numSeats > 0 {
-			for i := 1; i <= numSeats; i++ {
-				seatIDs = append(seatIDs, fmt.Sprintf("SEAT-%d", i))
-			}
-		} else {
-			seatIDs = append(seatIDs, "GENERAL")
-		}
-	}
-
-	amount := egressPayload.Amount
-	if amount <= 0 {
-		if a, ok := currentPayload["amount"].(float64); ok && a > 0 {
-			amount = int(a)
-		} else {
-			amount = len(seatIDs) * 500
-		}
-	}
-
-	now := time.Now().UTC()
-	t := models.Ticket{
-		ID:            uuid.New(),
-		WorkflowID:    workflowUUID,
-		SeatIDs:       seatIDs,
-		Amount:        amount,
-		PaymentID:     egressPayload.PaymentID,
-		CustomerName:  customerName,
-		CustomerEmail: customerEmail,
-		Status:        "CONFIRMED",
-		CreatedAt:     now,
-	}
-
-	currentPayload["payment"] = map[string]any{
-		"status":         egressPayload.Status,
-		"amount":         amount,
-		"payment_id":     egressPayload.PaymentID,
-		"payment_method": egressPayload.PaymentMethod,
-	}
-	currentPayload["ticket"] = t
-
-	updatedWorkflowPayload, err := json.Marshal(currentPayload)
+	t, err := db.GenerateAndStoreTicket(ctx, tx, wf, currentPayload, paymentInfo)
 	if err != nil {
-		return false, fmt.Errorf("failed to marshal updated workflow payload for %s: %w", workflowUUID, err)
+		return false, err
 	}
-
-	completeWorkflowAndInsertTicket := `
-		WITH upserted_ticket AS (
-			INSERT INTO tickets (id, workflow_id, seat_ids, amount, payment_id, customer_name, customer_email, status, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (workflow_id) DO UPDATE
-			SET seat_ids = EXCLUDED.seat_ids,
-			    amount = EXCLUDED.amount,
-			    payment_id = COALESCE(EXCLUDED.payment_id, tickets.payment_id),
-			    customer_name = COALESCE(EXCLUDED.customer_name, tickets.customer_name),
-			    customer_email = COALESCE(EXCLUDED.customer_email, tickets.customer_email),
-			    status = EXCLUDED.status
-			RETURNING id
-		)
-		UPDATE workflows 
-		SET workflow_state = $10, 
-		    payload = $11, 
-		    state_timeout = NULL, 
-		    retry_count = 0 
-		WHERE id = $2`
-
-	_, err = tx.Exec(ctx, completeWorkflowAndInsertTicket,
-		t.ID,
-		t.WorkflowID,
-		t.SeatIDs,
-		t.Amount,
-		t.PaymentID,
-		t.CustomerName,
-		t.CustomerEmail,
-		t.Status,
-		t.CreatedAt,
-		shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED,
-		updatedWorkflowPayload,
-	)
-	if err != nil {
-		return false, fmt.Errorf("failed to insert ticket and complete workflow %s: %w", workflowUUID, err)
-	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
 	}
 
 	log.Printf("Workflow %s successfully transitioned to COMPLETED; ticket %s created", workflowUUID, t.ID)
 	return true, nil
-}
-
-func ProcessPaymentEgressBatch(ctx context.Context, messages []*consumer.Message) {
-	var toDelete []*consumer.Message
-	var toRelease []*consumer.Message
-
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-
-		deleted := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("Recovered from panic processing payment egress message %s: %v", msg.ID, r)
-				}
-			}()
-
-			shouldDelete, err := ProcessPaymentEgressMessage(ctx, msg)
-			if err != nil {
-				log.Printf("Error processing payment egress message %s: %v", msg.ID, err)
-				return
-			}
-
-			if shouldDelete {
-				toDelete = append(toDelete, msg)
-				deleted = true
-			}
-		}()
-
-		if !deleted {
-			toRelease = append(toRelease, msg)
-		}
-	}
-
-	if len(toDelete) > 0 {
-		consumer.DeleteAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, toDelete)
-	}
-
-	if len(toRelease) > 0 {
-		consumer.ChangeVisibilityAllBatches(ctx, shared_vars.PaymentEgressSQSClient, shared_vars.PaymentEgressQueueURL, toRelease, 0)
-	}
 }
