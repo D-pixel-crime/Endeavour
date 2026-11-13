@@ -24,14 +24,13 @@ type SweeperStats struct {
 	LastError              string    `json:"last_error,omitempty"`
 }
 
-const MaxRetries = 3
+const MaxRetries = 1
 
 func (s *Sweeper) calculateRetryTimeout(retryCount int) (taskTimeout int, stateTimeout int) {
-	// Base timeout: taskTimeoutSec (e.g. 15s)
-	// Dynamic backoff: base * (1 + 0.5 * retryCount)
-	taskTimeout = int(float64(s.taskTimeoutSec) * (1.0 + float64(retryCount)*0.5))
-	visibilitySec := s.taskTimeoutSec * 2
-	stateTimeout = taskTimeout + visibilitySec
+	// Base timeout: taskTimeoutSec (worker ingress visibility is source of truth)
+	// stateTimeout = 2 * ingressVis + 2 * egressVis + 10s queue lag buffer
+	taskTimeout = s.taskTimeoutSec
+	stateTimeout = (2 * s.taskTimeoutSec) + (2 * s.taskTimeoutSec) + 10
 	return taskTimeout, stateTimeout
 }
 

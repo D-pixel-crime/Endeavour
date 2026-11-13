@@ -21,7 +21,7 @@ type BookingEgressPayload struct {
 }
 
 func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
-	egressPayload, _, ok := consumer.DecodePayload[BookingEgressPayload](
+	egressPayload, _, ok := consumer.DecodePayload(
 		msg, "booking egress", func(p *BookingEgressPayload) uuid.UUID { return p.WorkflowID },
 	)
 	if !ok {
@@ -53,8 +53,8 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	// 1. Booking Failed -> Check retries before marking whole workflow as FAILED
 	if egressPayload.Status == shared_vars.STATUS_FAILED {
-		const maxRetries = 2
-		bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
+		const maxRetries = 1
+		bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
 
 		// A. Handling Failure during Backward Compensation (COMPENSATING_BOOKING)
 		if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING {
@@ -255,7 +255,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	currentPayload["seat_ids"] = egressPayload.SeatIDs
 	currentPayload["num_seats"] = egressPayload.NumSeats
 
-	paymentTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.PaymentEgressVisibilityTimeout, shared_vars.PaymentTaskTimeoutSeconds)
+	paymentTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.PaymentIngressVisibilityTimeout, shared_vars.PaymentEgressVisibilityTimeout)
 
 	numSeats := egressPayload.NumSeats
 	if numSeats <= 0 && len(egressPayload.SeatIDs) > 0 {

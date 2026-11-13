@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/D-pixel-crime/Endeavour/aws_sqs_shared/producer"
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
@@ -46,23 +45,11 @@ func main() {
 	sqsProducer := producer.NewProducer(sqsClient, cfg.TargetQueueURL)
 	router := NewRouter(cfg)
 	poller := NewPoller(dbPool, sqsProducer, router, cfg.PollInterval, cfg.BatchSize, cfg.VisibilityTimeout)
-	server := NewServer(cfg.HTTPPort, sqsClient, router)
 
-	server.Start()
-	go poller.Start(ctx)
+	log.Printf("CDC service [%s] running in %s mode (interval: %v)",
+		cfg.ServiceName, cfg.Mode, cfg.PollInterval)
 
-	log.Printf("CDC service [%s] running in %s mode (port :%s, interval: %v)",
-		cfg.ServiceName, cfg.Mode, cfg.HTTPPort, cfg.PollInterval)
+	poller.Start(ctx)
 
-	<-ctx.Done()
-	log.Printf("Shutting down CDC service [%s]...", cfg.ServiceName)
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-
-	log.Println("Shutdown complete")
+	log.Printf("CDC service [%s] shutdown complete", cfg.ServiceName)
 }

@@ -43,23 +43,11 @@ func main() {
 	}
 
 	sweeper := NewSweeper(dbPool, cfg.PollInterval, cfg.BatchSize, cfg.TaskTimeoutSec)
-	server := NewServer(cfg.HTTPPort, dbPool, sweeper)
 
-	server.Start()
-	go sweeper.Start(ctx)
+	log.Printf("Sweeper service running (interval: %v, batch size: %d)",
+		cfg.PollInterval, cfg.BatchSize)
 
-	log.Printf("Sweeper service running (port :%s, interval: %v, batch size: %d)",
-		cfg.HTTPPort, cfg.PollInterval, cfg.BatchSize)
+	sweeper.Start(ctx)
 
-	<-ctx.Done()
-	log.Println("Shutting down Sweeper service...")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-
-	log.Println("Sweeper service shutdown complete")
+	log.Println("Shutdown complete")
 }

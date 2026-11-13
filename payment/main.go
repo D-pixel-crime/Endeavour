@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,11 +12,9 @@ import (
 	"time"
 
 	sqs_config "github.com/D-pixel-crime/Endeavour/aws_sqs_shared/config"
-	"github.com/D-pixel-crime/Endeavour/payment/handlers"
 	"github.com/D-pixel-crime/Endeavour/payment/poller"
 	"github.com/D-pixel-crime/Endeavour/payment/shared"
 	"github.com/D-pixel-crime/Endeavour/utility"
-	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
@@ -33,31 +30,28 @@ func main() {
 	}
 	defer shared.DBPool.Close()
 
-	poll_interval_str := os.Getenv("PAYMENT_POLL_INTERVAL_SECONDS")
-	if poll_interval_str == "" {
-		log.Fatalf("PAYMENT_POLL_INTERVAL_SECONDS is not set")
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	poll_interval_sec := 5
+	if poll_interval_sec_str := os.Getenv("PAYMENT_POLL_INTERVAL_SECONDS"); poll_interval_sec_str != "" {
+		if sec, err := strconv.Atoi(poll_interval_sec_str); err == nil && sec > 0 {
+			poll_interval_sec = sec
+		}
 	}
 
-	poll_interval_sec, err := strconv.Atoi(poll_interval_str)
-	if err != nil {
-		log.Fatalf("Failed to convert interval to seconds: %v", err)
-	}
-
-	visTimeoutStr := os.Getenv("PAYMENT_VISIBILITY_TIMEOUT_SECONDS")
+	visTimeoutStr := os.Getenv("PAYMENT_INGRESS_VISIBILITY_TIMEOUT_SECONDS")
 	if visTimeoutStr == "" {
-		visTimeoutStr = os.Getenv("PAYMENT_INGRESS_VISIBILITY_TIMEOUT_SECONDS")
+		visTimeoutStr = os.Getenv("PAYMENT_VISIBILITY_TIMEOUT_SECONDS")
 	}
 	if visTimeoutStr == "" {
-		log.Fatalf("PAYMENT_VISIBILITY_TIMEOUT_SECONDS is not set")
+		log.Fatalf("PAYMENT_INGRESS_VISIBILITY_TIMEOUT_SECONDS is not set")
 	}
 	visTimeoutSec, err := strconv.Atoi(visTimeoutStr)
 	if err != nil || visTimeoutSec <= 0 {
-		log.Fatalf("Invalid PAYMENT_VISIBILITY_TIMEOUT_SECONDS: %v", err)
+		log.Fatalf("Invalid PAYMENT_INGRESS_VISIBILITY_TIMEOUT_SECONDS: %v", err)
 	}
 	shared.IngressVisibilityTimeout = int32(visTimeoutSec)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	shared.IngressQueueURL = os.Getenv("PAYMENT_INGRESS_SQS_URL")
 	if shared.IngressQueueURL == "" {
@@ -72,29 +66,6 @@ func main() {
 		log.Fatalf("Failed to create Ingress SQS client: %v", err)
 	}
 
-	r := gin.Default()
-	r.GET("/payment/:workflow_id", handlers.GetPaymentByWorkflowID)
-	r.GET("/payments/:workflow_id", handlers.GetPaymentByWorkflowID)
-
-	port := os.Getenv("PAYMENT_PORT")
-	if port == "" {
-		port = "3001"
-	}
-
-	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      r,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		log.Printf("Starting HTTP server on :%s", port)
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("HTTP server error: %v", err)
-		}
-	}()
-
 	maxConcurrentPulls := 5
 	if maxConcurrentStr := os.Getenv("PAYMENT_MAX_CONCURRENT_PULLS"); maxConcurrentStr != "" {
 		if n, err := strconv.Atoi(maxConcurrentStr); err == nil && n > 0 {
@@ -108,27 +79,9 @@ func main() {
 	})
 
 	<-ctx.Done()
-	log.Print("Shutting down Payment Worker...")
+	log.Println("Shutting down Payment Worker...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-
-	pollersDone := make(chan struct{})
-	go func() {
-		pollerWg.Wait()
-		close(pollersDone)
-	}()
-
-	select {
-	case <-pollersDone:
-		log.Println("Payment ingress poller stopped cleanly")
-	case <-shutdownCtx.Done():
-		log.Println("Timed out waiting for payment ingress poller to stop")
-	}
-
+	pollerWg.Wait()
+	log.Println("Payment ingress poller stopped cleanly")
 	log.Println("Shutdown complete")
 }

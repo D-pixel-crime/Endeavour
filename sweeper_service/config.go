@@ -12,7 +12,6 @@ type Config struct {
 	DatabaseURL    string
 	PollInterval   time.Duration
 	BatchSize      int
-	HTTPPort       string
 	TaskTimeoutSec int
 }
 
@@ -71,23 +70,17 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	taskTimeout := visTimeout / 2
+	taskTimeout := visTimeout
 	if timeoutStr := os.Getenv("SWEEPER_TASK_TIMEOUT_SECONDS"); timeoutStr != "" {
 		if t, err := strconv.Atoi(timeoutStr); err == nil && t > 0 {
 			taskTimeout = t
 		}
 	}
 
-	httpPort := os.Getenv("SWEEPER_PORT")
-	if httpPort == "" {
-		httpPort = "3004"
-	}
-
 	return &Config{
 		DatabaseURL:    dbURL,
 		PollInterval:   pollInterval,
 		BatchSize:      batchSize,
-		HTTPPort:       httpPort,
 		TaskTimeoutSec: taskTimeout,
 	}, nil
 }

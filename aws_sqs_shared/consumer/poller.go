@@ -3,7 +3,6 @@ package consumer
 import (
 	"context"
 	"log"
-	"math"
 	"strings"
 	"sync"
 	"time"
@@ -139,97 +138,20 @@ func (p *BatchPoller) pullAndProcess(ctx context.Context) {
 		return
 	}
 
-	receivedAt := time.Now()
-	visibilityTimeout := time.Duration(p.cfg.VisibilityTimeout) * time.Second
-	currentDeadline := receivedAt.Add(visibilityTimeout)
-
-	batchTimeout := p.cfg.ProcessTimeout
-	var toExtend []*Message
-	var maxRequiredVisibilitySec int32 = p.cfg.VisibilityTimeout
-
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-
-		updatedAt := msg.UpdatedAt
-		if updatedAt.IsZero() {
-			updatedAt = receivedAt
-		}
-
-		procTimeout := p.cfg.ProcessTimeout
-		if msg.Payload != nil {
-			if ts, ok := msg.Payload["timeout_seconds"].(float64); ok && ts > 0 {
-				procTimeout = time.Duration(ts) * time.Second
-			} else if tp, ok := msg.Payload["timeout_parameter"].(float64); ok && tp > 0 {
-				procTimeout = time.Duration(tp) * time.Second
-			}
-		}
-
-		if procTimeout > batchTimeout {
-			batchTimeout = procTimeout
-		}
-
-		completionTime := updatedAt.Add(procTimeout)
-		if completionTime.After(currentDeadline) || receivedAt.Add(procTimeout).After(currentDeadline) {
-			toExtend = append(toExtend, msg)
-			neededSec := int32(math.Ceil(time.Until(completionTime).Seconds())) + 5
-			if neededSec > maxRequiredVisibilitySec {
-				maxRequiredVisibilitySec = neededSec
-			}
-		}
-	}
-
-	if len(toExtend) > 0 {
-		if maxRequiredVisibilitySec > 43200 { // AWS SQS maximum visibility timeout is 12 hours
-			maxRequiredVisibilitySec = 43200
-		}
-		log.Printf("[%s Poller] Completion time from updatedAt and processTimeout exceeds visibilityPeriod (%v); extending visibility to %ds for %d message(s)",
-			p.cfg.Name, visibilityTimeout, maxRequiredVisibilitySec, len(toExtend))
-		if _, err := ChangeVisibilityAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, toExtend, maxRequiredVisibilitySec); err != nil {
-			log.Printf("[%s Poller] Failed to extend visibility: %v", p.cfg.Name, err)
-		}
-	}
-
-	processCtx, cancel := context.WithTimeout(ctx, batchTimeout)
+	processCtx, cancel := context.WithTimeout(ctx, p.cfg.ProcessTimeout)
 	defer cancel()
-
-	// In-flight visibility extension heartbeat
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		heartbeatInterval := max(time.Duration(p.cfg.VisibilityTimeout/2)*time.Second, time.Second)
-		ticker := time.NewTicker(heartbeatInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-done:
-				return
-			case <-processCtx.Done():
-				return
-			case <-ticker.C:
-				log.Printf("[%s Poller] Processing still in-flight, extending visibility by %ds for %d message(s)",
-					p.cfg.Name, p.cfg.VisibilityTimeout, len(messages))
-				_, _ = ChangeVisibilityAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, messages, p.cfg.VisibilityTimeout)
-			}
-		}
-	}()
 
 	p.processMessageBatch(processCtx, messages)
 }
 
 func (p *BatchPoller) processMessageBatch(ctx context.Context, messages []*Message) {
 	var toDelete []*Message
-	var toRelease []*Message
 
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
 
-		deleted := false
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -245,20 +167,11 @@ func (p *BatchPoller) processMessageBatch(ctx context.Context, messages []*Messa
 
 			if shouldDelete {
 				toDelete = append(toDelete, msg)
-				deleted = true
 			}
 		}()
-
-		if !deleted {
-			toRelease = append(toRelease, msg)
-		}
 	}
 
 	if len(toDelete) > 0 {
 		DeleteAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, toDelete)
-	}
-
-	if len(toRelease) > 0 {
-		ChangeVisibilityAllBatches(ctx, p.cfg.Client, p.cfg.QueueURL, toRelease, 0)
 	}
 }

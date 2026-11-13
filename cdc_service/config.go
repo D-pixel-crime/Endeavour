@@ -23,7 +23,6 @@ type Config struct {
 	DatabaseURL       string
 	PollInterval      time.Duration
 	BatchSize         int
-	HTTPPort          string
 	VisibilityTimeout int
 
 	TargetQueueURL string
@@ -89,19 +88,6 @@ func LoadConfig() (*Config, error) {
 		batchSize = parsed
 	}
 
-	port := os.Getenv("CDC_PORT")
-	if port == "" {
-		port = os.Getenv("PORT")
-	}
-	if port == "" {
-		port = os.Getenv("CDC_BOOKING_PORT")
-	}
-	if port == "" {
-		port = os.Getenv("CDC_ORCHESTRATOR_PORT")
-	}
-	if port == "" {
-		port = "8080"
-	}
 
 	visTimeoutStr := os.Getenv("CDC_VISIBILITY_TIMEOUT_SECONDS")
 	if visTimeoutStr == "" {
@@ -211,7 +197,6 @@ func LoadConfig() (*Config, error) {
 		DatabaseURL:       dbURL,
 		PollInterval:      time.Duration(intervalSec) * time.Second,
 		BatchSize:         batchSize,
-		HTTPPort:          port,
 		VisibilityTimeout: visTimeoutSec,
 		TargetQueueURL:    singleQueueURL,
 		TargetQueues:      targetQueues,

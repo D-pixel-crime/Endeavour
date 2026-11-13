@@ -1,12 +1,7 @@
 package gethandlers
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"strings"
-	"time"
 
 	"github.com/D-pixel-crime/Endeavour/orchestrator/db"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/db/models"
@@ -16,66 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-type paymentStatusResponse struct {
-	WorkflowID    string   `json:"workflow_id"`
-	PaymentID     string   `json:"payment_id"`
-	Amount        int      `json:"amount"`
-	PaymentMethod string   `json:"payment_method"`
-	Status        string   `json:"status"`
-	WorkflowState string   `json:"workflow_state"`
-	Completed     bool     `json:"completed"`
-	SeatIDs       []string `json:"seat_ids"`
-	NumSeats      int      `json:"num_seats"`
-}
-
-var paymentHTTPClient = &http.Client{Timeout: 5 * time.Second}
-
-var fetchPaymentStatus = defaultFetchPaymentStatus
-
-func defaultFetchPaymentStatus(ctx context.Context, workflowID uuid.UUID) (*paymentStatusResponse, error) {
-	baseURL := strings.TrimRight(shared_vars.PaymentServiceURL, "/")
-	if baseURL == "" {
-		baseURL = "http://localhost:3001"
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+"/payment/"+workflowID.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build payment status request: %w", err)
-	}
-
-	resp, err := paymentHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("payment service request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return &paymentStatusResponse{
-			WorkflowID: workflowID.String(),
-			Completed:  false,
-		}, nil
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("payment service returned unexpected status %d", resp.StatusCode)
-	}
-
-	var statusResp paymentStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&statusResp); err != nil {
-		return nil, fmt.Errorf("failed to decode payment status response: %w", err)
-	}
-	return &statusResp, nil
-}
-
-func isTicketEligibleState(state shared_vars.Orchestrator_WorkflowState) bool {
-	return state == shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT ||
-		state == shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED
-}
-
-func resolveCompletedPayment(ctx context.Context, wf *models.Workflow) (db.PaymentInfo, bool, error) {
+func resolveCompletedPayment(wf *models.Workflow) (db.PaymentInfo, bool) {
 	currentPayload := db.UnmarshalWorkflowPayload(wf.Payload)
 	paymentInfo, paymentDone := db.ExtractPaymentInfoFromPayload(currentPayload)
 
@@ -83,48 +19,10 @@ func resolveCompletedPayment(ctx context.Context, wf *models.Workflow) (db.Payme
 		if paymentInfo.Status == "" {
 			paymentInfo.Status = shared_vars.STATUS_COMPLETED
 		}
-		if paymentInfo.PaymentID == "" || paymentInfo.Amount <= 0 {
-			if statusResp, err := fetchPaymentStatus(ctx, wf.ID); err == nil && statusResp.Completed {
-				if paymentInfo.PaymentID == "" {
-					paymentInfo.PaymentID = statusResp.PaymentID
-				}
-				if paymentInfo.Amount <= 0 {
-					paymentInfo.Amount = statusResp.Amount
-				}
-				if paymentInfo.PaymentMethod == "" {
-					paymentInfo.PaymentMethod = statusResp.PaymentMethod
-				}
-				if len(paymentInfo.SeatIDs) == 0 {
-					paymentInfo.SeatIDs = statusResp.SeatIDs
-				}
-				if paymentInfo.NumSeats <= 0 {
-					paymentInfo.NumSeats = statusResp.NumSeats
-				}
-			}
-		}
-		return paymentInfo, true, nil
+		return paymentInfo, true
 	}
 
-	if paymentDone {
-		return paymentInfo, true, nil
-	}
-
-	statusResp, err := fetchPaymentStatus(ctx, wf.ID)
-	if err != nil {
-		return db.PaymentInfo{}, false, err
-	}
-	if !statusResp.Completed {
-		return db.PaymentInfo{}, false, nil
-	}
-
-	return db.PaymentInfo{
-		PaymentID:     statusResp.PaymentID,
-		Amount:        statusResp.Amount,
-		PaymentMethod: statusResp.PaymentMethod,
-		Status:        statusResp.Status,
-		SeatIDs:       statusResp.SeatIDs,
-		NumSeats:      statusResp.NumSeats,
-	}, true, nil
+	return paymentInfo, paymentDone
 }
 
 func parseWorkflowIDAndPool(c *gin.Context) (uuid.UUID, bool) {
@@ -171,7 +69,7 @@ func GetTicketByWorkflowID(c *gin.Context) {
 		return
 	}
 
-	if !isTicketEligibleState(wf.WorkflowState) {
+	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error":          "ticket not found",
 			"workflow_state": wf.WorkflowState,
@@ -179,18 +77,7 @@ func GetTicketByWorkflowID(c *gin.Context) {
 		return
 	}
 
-	paymentInfo, paymentCompleted, err := resolveCompletedPayment(ctx, wf)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to verify payment status: " + err.Error()})
-		return
-	}
-	if !paymentCompleted {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error":          "ticket not found",
-			"workflow_state": wf.WorkflowState,
-		})
-		return
-	}
+	paymentInfo, _ := resolveCompletedPayment(wf)
 
 	tx, err := shared_vars.Orchestrator_DB_Pool.Begin(ctx)
 	if err != nil {
@@ -222,7 +109,7 @@ func GetTicketByWorkflowID(c *gin.Context) {
 		return
 	}
 
-	if !isTicketEligibleState(lockedWf.WorkflowState) {
+	if lockedWf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error":          "ticket not found",
 			"workflow_state": lockedWf.WorkflowState,

@@ -71,13 +71,18 @@ func main() {
 		}
 		shared_vars.BookingEgressVisibilityTimeout = int32(sec)
 
-		bookingTaskTimeout := sec / 2
-		if s := os.Getenv("BOOKING_TASK_TIMEOUT_SECONDS"); s != "" {
+		bookingIngressVis := sec
+		if s := os.Getenv("BOOKING_INGRESS_VISIBILITY_TIMEOUT_SECONDS"); s != "" {
 			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
-				bookingTaskTimeout = parsed
+				bookingIngressVis = parsed
+			}
+		} else if s := os.Getenv("BOOKING_VISIBILITY_TIMEOUT_SECONDS"); s != "" {
+			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
+				bookingIngressVis = parsed
 			}
 		}
-		shared_vars.BookingTaskTimeoutSeconds = bookingTaskTimeout
+		shared_vars.BookingIngressVisibilityTimeout = int32(bookingIngressVis)
+		shared_vars.BookingTaskTimeoutSeconds = bookingIngressVis
 
 		shared_vars.BookingEgressSQSClient, err = sqs_config.NewDefaultSQSClient(ctx)
 		if err != nil {
@@ -109,13 +114,18 @@ func main() {
 		}
 		shared_vars.PaymentEgressVisibilityTimeout = int32(sec)
 
-		paymentTaskTimeout := sec / 2
-		if s := os.Getenv("PAYMENT_TASK_TIMEOUT_SECONDS"); s != "" {
+		paymentIngressVis := sec
+		if s := os.Getenv("PAYMENT_INGRESS_VISIBILITY_TIMEOUT_SECONDS"); s != "" {
 			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
-				paymentTaskTimeout = parsed
+				paymentIngressVis = parsed
+			}
+		} else if s := os.Getenv("PAYMENT_VISIBILITY_TIMEOUT_SECONDS"); s != "" {
+			if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
+				paymentIngressVis = parsed
 			}
 		}
-		shared_vars.PaymentTaskTimeoutSeconds = paymentTaskTimeout
+		shared_vars.PaymentIngressVisibilityTimeout = int32(paymentIngressVis)
+		shared_vars.PaymentTaskTimeoutSeconds = paymentIngressVis
 
 		shared_vars.PaymentEgressSQSClient, err = sqs_config.NewDefaultSQSClient(ctx)
 		if err != nil {
@@ -151,14 +161,6 @@ func main() {
 	concurrencyLimiter := middleware.NewConcurrencyLimiter(maxConcurrentCreates)
 	defer middleware.GlobalIdempotencyCache.Stop()
 
-	shared_vars.PaymentServiceURL = strings.TrimRight(os.Getenv("PAYMENT_SERVICE_URL"), "/")
-	if shared_vars.PaymentServiceURL == "" {
-		paymentPort := os.Getenv("PAYMENT_PORT")
-		if paymentPort == "" {
-			paymentPort = "3001"
-		}
-		shared_vars.PaymentServiceURL = "http://localhost:" + strings.TrimPrefix(paymentPort, ":")
-	}
 
 	r := gin.Default()
 
@@ -203,18 +205,8 @@ func main() {
 		log.Printf("Server shutdown error: %v", err)
 	}
 
-	pollersDone := make(chan struct{})
-	go func() {
-		pollerWg.Wait()
-		close(pollersDone)
-	}()
-
-	select {
-	case <-pollersDone:
-		log.Println("All egress pollers stopped cleanly")
-	case <-shutdownCtx.Done():
-		log.Println("Timed out waiting for egress pollers to stop")
-	}
+	pollerWg.Wait()
+	log.Println("All egress pollers stopped cleanly")
 
 	log.Println("Shutdown complete")
 }

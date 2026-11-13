@@ -30,10 +30,7 @@ func ChangeMessageVisibilityBatch(ctx context.Context, client *sqs.Client, queue
 		}
 	}
 
-	reqCtx, cancel := batchRequestContext(ctx)
-	defer cancel()
-
-	result, err := client.ChangeMessageVisibilityBatch(reqCtx, &sqs.ChangeMessageVisibilityBatchInput{
+	result, err := client.ChangeMessageVisibilityBatch(ctx, &sqs.ChangeMessageVisibilityBatchInput{
 		QueueUrl: aws.String(queueURL),
 		Entries:  entries,
 	})

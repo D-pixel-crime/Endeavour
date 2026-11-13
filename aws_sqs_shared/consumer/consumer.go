@@ -166,12 +166,6 @@ func batchEntryID(msg *Message, idx int) string {
 	return msg.ID.String()
 }
 
-func batchRequestContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx.Err() != nil {
-		return context.WithTimeout(context.Background(), 5*time.Second)
-	}
-	return ctx, func() {}
-}
 
 func mapBatchErrors(entries []types.BatchResultErrorEntry) []BatchError {
 	failed := make([]BatchError, len(entries))

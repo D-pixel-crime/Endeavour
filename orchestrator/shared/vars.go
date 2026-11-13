@@ -6,17 +6,18 @@ import (
 )
 
 var (
-	Orchestrator_DB_Pool           *pgxpool.Pool
-	BookingEgressSQSClient         *sqs.Client
-	BookingEgressQueueURL          string
-	BookingEgressVisibilityTimeout int32
-	PaymentEgressSQSClient         *sqs.Client
-	PaymentEgressQueueURL          string
-	PaymentEgressVisibilityTimeout int32
+	Orchestrator_DB_Pool            *pgxpool.Pool
+	BookingEgressSQSClient          *sqs.Client
+	BookingEgressQueueURL           string
+	BookingIngressVisibilityTimeout int32
+	BookingEgressVisibilityTimeout  int32
+	PaymentEgressSQSClient          *sqs.Client
+	PaymentEgressQueueURL           string
+	PaymentIngressVisibilityTimeout int32
+	PaymentEgressVisibilityTimeout  int32
 
 	BookingTaskTimeoutSeconds int
 	PaymentTaskTimeoutSeconds int
-	PaymentServiceURL         string
 )
 
 type WorkerType string

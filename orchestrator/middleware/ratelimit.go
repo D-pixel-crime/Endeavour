@@ -1,10 +1,7 @@
 package middleware
 
 import (
-	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -44,10 +41,7 @@ func NewTokenBucketLimiter(cfg LimiterConfig) *TokenBucketLimiter {
 		cfg.RPS = 10
 	}
 	if cfg.Burst <= 0 {
-		cfg.Burst = int(cfg.RPS) * 2
-		if cfg.Burst < 1 {
-			cfg.Burst = 1
-		}
+		cfg.Burst = max(int(cfg.RPS)*2, 1)
 	}
 	if cfg.CleanupTTL <= 0 {
 		cfg.CleanupTTL = 5 * time.Minute
@@ -118,60 +112,19 @@ func (tbl *TokenBucketLimiter) getLimiter(clientKey string) *rate.Limiter {
 	return entry.limiter
 }
 
-// ExtractClientIP extracts the real client IP, respecting proxy headers if present.
-func ExtractClientIP(c *gin.Context) string {
-	// 1. Check X-Forwarded-For (standard reverse proxy / load balancer header)
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
-			}
-		}
-	}
-
-	// 2. Check X-Real-IP
-	if xrip := c.GetHeader("X-Real-IP"); xrip != "" {
-		ip := strings.TrimSpace(xrip)
-		if ip != "" {
-			return ip
-		}
-	}
-
-	// 3. Fallback to Gin's ClientIP()
-	ip := c.ClientIP()
-	if ip == "" {
-		return "unknown"
-	}
-	return ip
-}
-
 // Middleware returns a Gin middleware handler enforcing token bucket rate limiting.
 func (tbl *TokenBucketLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		clientKey := ExtractClientIP(c)
+		clientKey := c.ClientIP()
 		limiter := tbl.getLimiter(clientKey)
 
-		// Set rate limit metadata headers
-		c.Header("X-RateLimit-Limit", strconv.Itoa(tbl.burst))
-
 		if !limiter.Allow() {
-			c.Header("X-RateLimit-Remaining", "0")
 			c.Header("Retry-After", "1")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error":               fmt.Sprintf("Rate limit exceeded (%d requests burst limit). Please retry shortly.", tbl.burst),
-				"retry_after_seconds": 1,
+				"error": "Rate limit exceeded. Please retry shortly.",
 			})
 			return
 		}
-
-		// Calculate approximate tokens remaining
-		tokens := int(limiter.Tokens())
-		if tokens < 0 {
-			tokens = 0
-		}
-		c.Header("X-RateLimit-Remaining", strconv.Itoa(tokens))
 
 		c.Next()
 	}

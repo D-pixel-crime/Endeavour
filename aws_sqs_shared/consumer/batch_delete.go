@@ -26,10 +26,7 @@ func DeleteMessageBatch(ctx context.Context, client *sqs.Client, queueURL string
 		}
 	}
 
-	reqCtx, cancel := batchRequestContext(ctx)
-	defer cancel()
-
-	result, err := client.DeleteMessageBatch(reqCtx, &sqs.DeleteMessageBatchInput{
+	result, err := client.DeleteMessageBatch(ctx, &sqs.DeleteMessageBatchInput{
 		QueueUrl: aws.String(queueURL),
 		Entries:  entries,
 	})

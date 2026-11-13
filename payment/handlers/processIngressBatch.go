@@ -28,20 +28,9 @@ type PaymentIngressPayload struct {
 	SeatIDs         []string         `json:"seat_ids"`
 	PaymentMethod   string           `json:"payment_method"`
 	CustomerDetails *CustomerDetails `json:"customer_details,omitempty"`
-	TimeoutSeconds  int              `json:"timeout_seconds,omitempty"`
 }
 
-func resolvePaymentTimeout(ingress PaymentIngressPayload) int {
-	if ingress.TimeoutSeconds > 0 {
-		return ingress.TimeoutSeconds
-	}
-	if t := int(shared.IngressVisibilityTimeout / 2); t > 0 {
-		return t
-	}
-	return 15
-}
-
-func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, seatIDs []string, numSeats int, payloadBytes []byte, timeoutSec int) {
+func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, seatIDs []string, numSeats int, payloadBytes []byte) {
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
 		log.Printf("Failed to begin transaction for recording payment failure: %v", err)
@@ -50,13 +39,12 @@ func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action stri
 	defer tx.Rollback(ctx)
 
 	failOutbox := map[string]any{
-		"workflow_id":     workflowUUID.String(),
-		"status":          shared.STATUS_FAILED,
-		"reason":          reason,
-		"seat_ids":        seatIDs,
-		"num_seats":       numSeats,
-		"updated_at":      time.Now().UTC().Format(time.RFC3339),
-		"timeout_seconds": timeoutSec,
+		"workflow_id": workflowUUID.String(),
+		"status":      shared.STATUS_FAILED,
+		"reason":      reason,
+		"seat_ids":    seatIDs,
+		"num_seats":   numSeats,
+		"updated_at":  time.Now().UTC().Format(time.RFC3339),
 	}
 	if action != "" {
 		failOutbox["action"] = action
@@ -81,7 +69,7 @@ func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action stri
 	_ = tx.Commit(ctx)
 }
 
-func reemitPaymentOutbox(ctx context.Context, tx pgx.Tx, workflowUUID uuid.UUID, payload map[string]any, label string) (bool, error) {
+func writeOutboxResponse(ctx context.Context, tx pgx.Tx, workflowUUID uuid.UUID, payload map[string]any, label string) (bool, error) {
 	outboxBytes, _ := json.Marshal(payload)
 	_, _ = tx.Exec(ctx,
 		`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
@@ -89,17 +77,17 @@ func reemitPaymentOutbox(ctx context.Context, tx pgx.Tx, workflowUUID uuid.UUID,
 		uuid.New(), workflowUUID, outboxBytes,
 	)
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("failed to commit re-emitted %s payment outbox: %w", label, err)
+		return false, fmt.Errorf("failed to commit %s payment outbox: %w", label, err)
 	}
-	log.Printf("Workflow %s payment is already %s; re-emitted egress outbox message to satisfy orchestrator retry", workflowUUID, label)
+	log.Printf("[IDEMPOTENCY] Workflow %s payment is already %s; writing outbox message for duplicate delivery", workflowUUID, label)
 	return true, nil
 }
 
-func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayload, payloadBytes []byte, timeoutSec int) (bool, error) {
+func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayload, payloadBytes []byte) (bool, error) {
 	workflowUUID := ingress.WorkflowID
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
 		return true, nil
 	}
 	defer tx.Rollback(ctx)
@@ -117,7 +105,7 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 			_, err = tx.Exec(ctx, `UPDATE payments SET status = 'REFUNDED' WHERE workflow_id = $1`, workflowUUID)
 			if err != nil {
 				tx.Rollback(ctx)
-				emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes, timeoutSec)
+				emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
 				return true, nil
 			}
 			log.Printf("[PAYMENT COMPENSATION] Refunded amount %d for workflow %s", amount, workflowUUID)
@@ -129,18 +117,17 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 	}
 
 	outboxPayload := map[string]any{
-		"workflow_id":     workflowUUID.String(),
-		"status":          shared.STATUS_COMPENSATED,
-		"action":          shared.ACTION_COMPENSATE,
-		"seat_ids":        ingress.SeatIDs,
-		"num_seats":       ingress.NumSeats,
-		"updated_at":      time.Now().UTC().Format(time.RFC3339),
-		"timeout_seconds": timeoutSec,
+		"workflow_id": workflowUUID.String(),
+		"status":      shared.STATUS_COMPENSATED,
+		"action":      shared.ACTION_COMPENSATE,
+		"seat_ids":    ingress.SeatIDs,
+		"num_seats":   ingress.NumSeats,
+		"updated_at":  time.Now().UTC().Format(time.RFC3339),
 	}
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
 		return true, nil
 	}
 
@@ -160,12 +147,12 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 	)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
 		return true, nil
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
 		return true, nil
 	}
 
@@ -174,7 +161,7 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 }
 
 func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (bool, error) {
-	ingressPayload, payloadBytes, ok := consumer.DecodePayload[PaymentIngressPayload](
+	ingressPayload, payloadBytes, ok := consumer.DecodePayload(
 		msg, "payment", func(p *PaymentIngressPayload) uuid.UUID { return p.WorkflowID },
 	)
 	if !ok {
@@ -186,14 +173,13 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	}
 
 	workflowUUID := ingressPayload.WorkflowID
-	timeoutSec := resolvePaymentTimeout(ingressPayload)
 
 	// 1. Handle Compensation
 	if ingressPayload.Action == shared.ACTION_COMPENSATE {
-		return handlePaymentCompensation(ctx, ingressPayload, payloadBytes, timeoutSec)
+		return handlePaymentCompensation(ctx, ingressPayload, payloadBytes)
 	}
 
-	// 2. Normal Payment (No local retry loop: Orchestrator manages retries)
+	// 2. Normal Payment (Worker performs single attempt; Orchestrator manages retries)
 	paymentMethod := ingressPayload.PaymentMethod
 	if paymentMethod == "" && ingressPayload.CustomerDetails != nil {
 		paymentMethod = ingressPayload.CustomerDetails.PaymentMethod
@@ -215,7 +201,7 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to begin transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to begin transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
 		return true, nil
 	}
 	defer tx.Rollback(ctx)
@@ -229,25 +215,23 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 			var currentAmount int
 			var pMethod string
 			_ = tx.QueryRow(ctx, `SELECT id, amount, payment_method FROM payments WHERE workflow_id = $1`, workflowUUID).Scan(&paymentID, &currentAmount, &pMethod)
-			return reemitPaymentOutbox(ctx, tx, workflowUUID, map[string]any{
-				"workflow_id":     workflowUUID.String(),
-				"status":          shared.STATUS_COMPLETED,
-				"amount":          currentAmount,
-				"payment_method":  pMethod,
-				"payment_id":      paymentID.String(),
-				"seat_ids":        ingressPayload.SeatIDs,
-				"num_seats":       ingressPayload.NumSeats,
-				"updated_at":      time.Now().UTC().Format(time.RFC3339),
-				"timeout_seconds": timeoutSec,
+			return writeOutboxResponse(ctx, tx, workflowUUID, map[string]any{
+				"workflow_id":    workflowUUID.String(),
+				"status":         shared.STATUS_COMPLETED,
+				"amount":         currentAmount,
+				"payment_method": pMethod,
+				"payment_id":     paymentID.String(),
+				"seat_ids":       ingressPayload.SeatIDs,
+				"num_seats":      ingressPayload.NumSeats,
+				"updated_at":     time.Now().UTC().Format(time.RFC3339),
 			}, "COMPLETED")
 
 		case string(shared.PAYMENT_WORKFLOW_FAILED):
-			return reemitPaymentOutbox(ctx, tx, workflowUUID, map[string]any{
-				"workflow_id":     workflowUUID.String(),
-				"status":          shared.STATUS_FAILED,
-				"reason":          "Payment previously failed",
-				"updated_at":      time.Now().UTC().Format(time.RFC3339),
-				"timeout_seconds": timeoutSec,
+			return writeOutboxResponse(ctx, tx, workflowUUID, map[string]any{
+				"workflow_id": workflowUUID.String(),
+				"status":      shared.STATUS_FAILED,
+				"reason":      "Payment previously failed",
+				"updated_at":  time.Now().UTC().Format(time.RFC3339),
 			}, "FAILED")
 
 		case string(shared.PAYMENT_WORKFLOW_COMPENSATING):
@@ -261,20 +245,19 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	paymentID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("payment:"+workflowUUID.String()))
 
 	outboxPayload := map[string]any{
-		"workflow_id":     workflowUUID.String(),
-		"status":          shared.STATUS_COMPLETED,
-		"amount":          amount,
-		"payment_method":  paymentMethod,
-		"payment_id":      paymentID.String(),
-		"seat_ids":        ingressPayload.SeatIDs,
-		"num_seats":       ingressPayload.NumSeats,
-		"updated_at":      time.Now().UTC().Format(time.RFC3339),
-		"timeout_seconds": timeoutSec,
+		"workflow_id":    workflowUUID.String(),
+		"status":         shared.STATUS_COMPLETED,
+		"amount":         amount,
+		"payment_method": paymentMethod,
+		"payment_id":     paymentID.String(),
+		"seat_ids":       ingressPayload.SeatIDs,
+		"num_seats":      ingressPayload.NumSeats,
+		"updated_at":     time.Now().UTC().Format(time.RFC3339),
 	}
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to marshal outbox payload: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to marshal outbox payload: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
 		return true, nil
 	}
 
@@ -304,12 +287,12 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to record completed payment and outbox: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to record completed payment and outbox: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
 		return true, nil
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to commit transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes, timeoutSec)
+		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to commit transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
 		return true, nil
 	}
 

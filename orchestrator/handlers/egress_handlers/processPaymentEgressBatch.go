@@ -63,8 +63,8 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	// 1. Payment Failed -> Check retries before going to backward compensation
 	if egressPayload.Status == shared_vars.STATUS_FAILED {
-		const maxRetries = 2
-		timeoutSec, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.PaymentEgressVisibilityTimeout, shared_vars.PaymentTaskTimeoutSeconds)
+		const maxRetries = 1
+		timeoutSec, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.PaymentIngressVisibilityTimeout, shared_vars.PaymentEgressVisibilityTimeout)
 
 		// A. Handling Failure during Backward Compensation (COMPENSATING_PAYMENT)
 		if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT {
@@ -109,7 +109,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			// Payment compensation retries exhausted (>= 2):
 			// Escalate directly to COMPENSATING_BOOKING to release reserved seats, and record a critical operator alert!
 			seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
-			bookingTimeout, bookingStateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
+			bookingTimeout, bookingStateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
 
 			currentPayload["payment_compensation_failure"] = map[string]any{
 				"status":            egressPayload.Status,
@@ -263,7 +263,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			"compensated_at": db.NewOutboxTimestamp(),
 		}
 
-		bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
+		bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
 		seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
 
 		_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{

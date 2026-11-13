@@ -3,7 +3,6 @@ package posthandlers
 import (
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/D-pixel-crime/Endeavour/orchestrator/db"
 	"github.com/D-pixel-crime/Endeavour/orchestrator/middleware"
@@ -100,27 +99,6 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	// 2. In-flight singleflight lock: prevent parallel requests with identical workflow_id from racing on DB locks
-	unlock, acquired := middleware.GlobalIdempotencyCache.TryLock(req.WorkflowID)
-	if !acquired {
-		if middleware.GlobalIdempotencyCache.WaitForInFlight(ctx, req.WorkflowID, 1*time.Second) {
-			if cachedState, found := middleware.GlobalIdempotencyCache.Get(req.WorkflowID); found {
-				c.JSON(http.StatusAlreadyReported, gin.H{
-					"Success":     "Workflow Already Exists",
-					"State":       cachedState,
-					"workflow_id": req.WorkflowID,
-				})
-				return
-			}
-		}
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusTooManyRequests, gin.H{
-			"error": "A workflow with this ID is currently being processed. Please retry shortly.",
-		})
-		return
-	}
-	defer unlock()
-
 	tx, err := shared_vars.Orchestrator_DB_Pool.Begin(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -149,8 +127,8 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	// Cascading rule: DB Timeout < Worker Processing (V/2) < SQS Visibility (V) < Orchestrator State Timeout (V + TaskTimeout)
-	bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingEgressVisibilityTimeout, shared_vars.BookingTaskTimeoutSeconds)
+	// stateTimeout = 2 * ingressVis + 2 * egressVis + 10s buffer
+	bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
 
 	bookingOutboxPayload := map[string]any{
 		"workflow_id":     req.WorkflowID.String(),

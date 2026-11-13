@@ -89,17 +89,21 @@ func ExtractPaymentMethod(payload map[string]any) string {
 	return ""
 }
 
-// ComputeStageTimeouts resolves task timeout and state timeout (visibility + task timeout) per cascading rules.
-func ComputeStageTimeouts(visTimeoutSec int32, configuredTaskTimeout int) (taskTimeoutSec int, stateTimeoutSec int) {
-	vis := int(visTimeoutSec)
-	if vis <= 0 {
-		vis = 30
+// ComputeStageTimeouts resolves task timeout and state timeout based on ingress and egress visibility timeouts.
+// State timeout is: (2 * ingressVis) + (2 * egressVis) + queue lag buffer (10s).
+func ComputeStageTimeouts(ingressVisSec, egressVisSec int32) (taskTimeoutSec int, stateTimeoutSec int) {
+	ingress := int(ingressVisSec)
+	if ingress <= 0 {
+		ingress = 30
 	}
-	task := configuredTaskTimeout
-	if task <= 0 {
-		task = vis / 2
+	egress := int(egressVisSec)
+	if egress <= 0 {
+		egress = 30
 	}
-	return task, vis + task
+	taskTimeoutSec = ingress
+	const queueLagBuffer = 10
+	stateTimeoutSec = (2 * ingress) + (2 * egress) + queueLagBuffer
+	return taskTimeoutSec, stateTimeoutSec
 }
 
 // TransitionParams describes an atomic workflow state/retry update and outbox task insertion.

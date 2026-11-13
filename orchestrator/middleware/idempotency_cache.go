@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -16,12 +15,11 @@ type cacheItem struct {
 // GlobalIdempotencyCache is the shared package instance used across handlers.
 var GlobalIdempotencyCache = NewIdempotencyCache(60*time.Second, 30*time.Second)
 
-// IdempotencyCache provides fast in-memory caching and in-flight deduplication
-// for workflow creation to protect the database from duplicate check floods.
+// IdempotencyCache provides fast in-memory caching for workflow creation
+// to protect the database from duplicate check floods.
 type IdempotencyCache struct {
 	mu              sync.RWMutex
 	cache           map[uuid.UUID]cacheItem
-	inFlight        map[uuid.UUID]chan struct{}
 	ttl             time.Duration
 	cleanupInterval time.Duration
 	stopChan        chan struct{}
@@ -39,7 +37,6 @@ func NewIdempotencyCache(ttl time.Duration, cleanupInterval time.Duration) *Idem
 
 	ic := &IdempotencyCache{
 		cache:           make(map[uuid.UUID]cacheItem),
-		inFlight:        make(map[uuid.UUID]chan struct{}),
 		ttl:             ttl,
 		cleanupInterval: cleanupInterval,
 		stopChan:        make(chan struct{}),
@@ -102,49 +99,5 @@ func (ic *IdempotencyCache) Set(id uuid.UUID, state string) {
 	ic.cache[id] = cacheItem{
 		state:     state,
 		expiresAt: time.Now().Add(ic.ttl),
-	}
-}
-
-// TryLock attempts to lock a workflow ID for in-flight execution.
-// If another request is currently processing this workflow ID, returns acquired = false.
-func (ic *IdempotencyCache) TryLock(id uuid.UUID) (unlock func(), acquired bool) {
-	ic.mu.Lock()
-	defer ic.mu.Unlock()
-
-	if _, exists := ic.inFlight[id]; exists {
-		return nil, false
-	}
-
-	ch := make(chan struct{})
-	ic.inFlight[id] = ch
-
-	unlock = func() {
-		ic.mu.Lock()
-		defer ic.mu.Unlock()
-		delete(ic.inFlight, id)
-		close(ch)
-	}
-
-	return unlock, true
-}
-
-// WaitForInFlight waits for an in-flight workflow creation with the given ID to complete,
-// up to the context timeout or waitTimeout. Returns true if completed, false if timed out.
-func (ic *IdempotencyCache) WaitForInFlight(ctx context.Context, id uuid.UUID, waitTimeout time.Duration) bool {
-	ic.mu.RLock()
-	ch, exists := ic.inFlight[id]
-	ic.mu.RUnlock()
-
-	if !exists {
-		return true
-	}
-
-	select {
-	case <-ch:
-		return true
-	case <-ctx.Done():
-		return false
-	case <-time.After(waitTimeout):
-		return false
 	}
 }
