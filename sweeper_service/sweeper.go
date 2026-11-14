@@ -24,31 +24,49 @@ type SweeperStats struct {
 	LastError              string    `json:"last_error,omitempty"`
 }
 
-const MaxRetries = 1
-
-func (s *Sweeper) calculateRetryTimeout(retryCount int) (taskTimeout int, stateTimeout int) {
+func (s *Sweeper) calculateStateTimeout() (taskTimeout int, stateTimeout int) {
 	// Base timeout: taskTimeoutSec (worker ingress visibility is source of truth)
-	// stateTimeout = 2 * ingressVis + 2 * egressVis + 10s queue lag buffer
+	// With queue-level redrive (up to R_in retries into DLQ before timeout compensation):
+	// stateTimeout = (R_in * ingressVis) + (R_out * egressVis) + buffer
 	taskTimeout = s.taskTimeoutSec
-	stateTimeout = (2 * s.taskTimeoutSec) + (2 * s.taskTimeoutSec) + 10
+	stateTimeout = (s.ingressMaxRetries * s.taskTimeoutSec) + (s.egressMaxRetries * s.taskTimeoutSec) + s.stageTimeoutBufferSec
 	return taskTimeout, stateTimeout
 }
 
 type Sweeper struct {
-	dbPool         *pgxpool.Pool
-	interval       time.Duration
-	batchSize      int
-	taskTimeoutSec int
-	stats          SweeperStats
-	statsMu        sync.RWMutex
+	dbPool                *pgxpool.Pool
+	interval              time.Duration
+	batchSize             int
+	taskTimeoutSec        int
+	ingressMaxRetries     int
+	egressMaxRetries      int
+	stageTimeoutBufferSec int
+	stats                 SweeperStats
+	statsMu               sync.RWMutex
 }
 
-func NewSweeper(dbPool *pgxpool.Pool, interval time.Duration, batchSize int, taskTimeoutSec int) *Sweeper {
+func NewSweeper(dbPool *pgxpool.Pool, interval time.Duration, batchSize int, taskTimeoutSec int, ingressRetries ...int) *Sweeper {
+	inRetries := 5
+	egRetries := 3
+	bufSec := 10
+	if len(ingressRetries) > 0 && ingressRetries[0] > 0 {
+		inRetries = ingressRetries[0]
+	}
+	if len(ingressRetries) > 1 && ingressRetries[1] > 0 {
+		egRetries = ingressRetries[1]
+	}
+	if len(ingressRetries) > 2 && ingressRetries[2] >= 0 {
+		bufSec = ingressRetries[2]
+	}
+
 	return &Sweeper{
-		dbPool:         dbPool,
-		interval:       interval,
-		batchSize:      batchSize,
-		taskTimeoutSec: taskTimeoutSec,
+		dbPool:                dbPool,
+		interval:              interval,
+		batchSize:             batchSize,
+		taskTimeoutSec:        taskTimeoutSec,
+		ingressMaxRetries:     inRetries,
+		egressMaxRetries:      egRetries,
+		stageTimeoutBufferSec: bufSec,
 	}
 }
 
@@ -149,250 +167,135 @@ func (s *Sweeper) Sweep(ctx context.Context) (int, error) {
 
 		switch wf.WorkflowState {
 		case shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING:
-			if wf.RetryCount < MaxRetries {
-				taskTimeout, stateTimeout := s.calculateRetryTimeout(wf.RetryCount)
-				nextRetry := wf.RetryCount + 1
+			// Booking step timed out after queue retries exhausted.
+			// Run speculative compensation in case seats were booked in the worker DB but egress was delayed or dropped.
+			taskTimeout, stateTimeout := s.calculateStateTimeout()
+			seatIDs := db.ExtractSeatIDs(currentPayload)
 
-				numSeats := 1
-				if ns, ok := currentPayload["num_seats"].(float64); ok && ns > 0 {
-					numSeats = int(ns)
-				}
-				_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
-					WorkflowID:      wf.ID,
-					NextState:       wf.WorkflowState,
-					StateTimeoutSec: stateTimeout,
-					RetryCount:      nextRetry,
-					WorkerType:      shared_vars.BOOKING_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     wf.ID.String(),
-						"num_seats":       numSeats,
-						"timeout_seconds": taskTimeout,
-					},
-					TaskTimeoutSec: taskTimeout,
-				})
-				if err != nil {
-					log.Printf("[SWEEPER] Error updating workflow %s and inserting outbox for BOOKING retry: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.TotalRetries++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Workflow %s timed out in BOOKING; re-dispatched retry (%d/%d) with timeout %ds", wf.ID, nextRetry, MaxRetries, stateTimeout)
-			} else {
-				currentPayload["timeout"] = map[string]any{
-					"timed_out_state": string(shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING),
-					"timed_out_at":    db.NewOutboxTimestamp(),
-					"reason":          fmt.Sprintf("Booking step exceeded state_timeout after %d retries (~2 min cap exhausted)", MaxRetries),
-				}
-				if err := db.MarkWorkflowFailed(sweepCtx, tx, wf.ID, currentPayload); err != nil {
-					log.Printf("[SWEEPER] Error updating timed-out booking %s to FAILED: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.FailedBookingTimeouts++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Workflow %s exhausted all %d retries in BOOKING state; marked as FAILED", wf.ID, MaxRetries)
+			currentPayload["timeout"] = map[string]any{
+				"timed_out_state": string(shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING),
+				"timed_out_at":    db.NewOutboxTimestamp(),
+				"reason":          "Booking step exceeded state_timeout after queue retries exhausted; initiating speculative compensation",
 			}
 
-		case shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT:
-			if wf.RetryCount < MaxRetries {
-				taskTimeout, stateTimeout := s.calculateRetryTimeout(wf.RetryCount)
-				nextRetry := wf.RetryCount + 1
-
-				seatIDs := db.ExtractSeatIDs(currentPayload)
-				numSeats := len(seatIDs)
-				if ns, ok := currentPayload["num_seats"].(float64); ok && ns > 0 {
-					numSeats = int(ns)
-				}
-				amount := numSeats * 500
-				if a, ok := currentPayload["amount"].(float64); ok && a > 0 {
-					amount = int(a)
-				}
-
-				paymentPayload := map[string]any{
+			_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
+				WorkflowID:      wf.ID,
+				NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
+				WorkflowPayload: currentPayload,
+				StateTimeoutSec: stateTimeout,
+				RetryCount:      0,
+				WorkerType:      shared_vars.BOOKING_WORKER,
+				OutboxPayload: map[string]any{
 					"workflow_id":     wf.ID.String(),
+					"action":          shared_vars.ACTION_COMPENSATE,
 					"seat_ids":        seatIDs,
-					"num_seats":       numSeats,
-					"amount":          amount,
+					"reason":          "Booking step timed out after queue retries exhausted; releasing any booked seats",
 					"updated_at":      db.NewOutboxTimestamp(),
 					"timeout_seconds": taskTimeout,
-				}
-				if pm := db.ExtractPaymentMethod(currentPayload); pm != "" {
-					paymentPayload["payment_method"] = pm
-				}
-
-				_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
-					WorkflowID:      wf.ID,
-					NextState:       wf.WorkflowState,
-					StateTimeoutSec: stateTimeout,
-					RetryCount:      nextRetry,
-					WorkerType:      shared_vars.PAYMENT_WORKER,
-					OutboxPayload:   paymentPayload,
-					TaskTimeoutSec:  taskTimeout,
-				})
-				if err != nil {
-					log.Printf("[SWEEPER] Error updating workflow %s and inserting outbox for PAYMENT retry: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.TotalRetries++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Workflow %s timed out in PAYMENT; re-dispatched retry (%d/%d) with timeout %ds", wf.ID, nextRetry, MaxRetries, stateTimeout)
-			} else {
-				timeoutSec := s.taskTimeoutSec
-				stateTimeoutSec := timeoutSec + (s.taskTimeoutSec * 2)
-
-				currentPayload["timeout"] = map[string]any{
-					"timed_out_state": string(shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT),
-					"timed_out_at":    db.NewOutboxTimestamp(),
-					"reason":          fmt.Sprintf("Payment step exceeded state_timeout after %d retries; initiating backward compensation", MaxRetries),
-				}
-
-				_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
-					WorkflowID:      wf.ID,
-					NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT,
-					WorkflowPayload: currentPayload,
-					StateTimeoutSec: stateTimeoutSec,
-					RetryCount:      0,
-					WorkerType:      shared_vars.PAYMENT_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     wf.ID.String(),
-						"action":          shared_vars.ACTION_COMPENSATE,
-						"reason":          fmt.Sprintf("Payment step exceeded state_timeout after %d retries; initiating backward compensation", MaxRetries),
-						"updated_at":      db.NewOutboxTimestamp(),
-						"timeout_seconds": timeoutSec,
-					},
-					TaskTimeoutSec: timeoutSec,
-				})
-				if err != nil {
-					log.Printf("[SWEEPER] Error updating workflow %s and inserting payment compensation outbox: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.CompensatedPayments++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Workflow %s exhausted all %d retries in PAYMENT; initiated backward compensation at PAYMENT", wf.ID, MaxRetries)
+				},
+				TaskTimeoutSec: taskTimeout,
+			})
+			if err != nil {
+				log.Printf("[SWEEPER] Error updating workflow %s and inserting booking compensation outbox: %v", wf.ID, err)
+				continue
 			}
+
+			s.recordStat(func(st *SweeperStats) {
+				st.FailedBookingTimeouts++
+				st.TotalSweptWorkflows++
+			})
+			log.Printf("[SWEEPER] Workflow %s timed out in BOOKING after queue retries; initiated speculative compensation at BOOKING", wf.ID)
+
+		case shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT:
+			// Payment step timed out after queue retries exhausted.
+			// Initiate backward compensation at PAYMENT (cascading to BOOKING).
+			taskTimeout, stateTimeout := s.calculateStateTimeout()
+
+			currentPayload["timeout"] = map[string]any{
+				"timed_out_state": string(shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT),
+				"timed_out_at":    db.NewOutboxTimestamp(),
+				"reason":          "Payment step exceeded state_timeout after queue retries exhausted; initiating backward compensation",
+			}
+
+			_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
+				WorkflowID:      wf.ID,
+				NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT,
+				WorkflowPayload: currentPayload,
+				StateTimeoutSec: stateTimeout,
+				RetryCount:      0,
+				WorkerType:      shared_vars.PAYMENT_WORKER,
+				OutboxPayload: map[string]any{
+					"workflow_id":     wf.ID.String(),
+					"action":          shared_vars.ACTION_COMPENSATE,
+					"reason":          "Payment step exceeded state_timeout after queue retries exhausted; initiating backward compensation",
+					"updated_at":      db.NewOutboxTimestamp(),
+					"timeout_seconds": taskTimeout,
+				},
+				TaskTimeoutSec: taskTimeout,
+			})
+			if err != nil {
+				log.Printf("[SWEEPER] Error updating workflow %s and inserting payment compensation outbox: %v", wf.ID, err)
+				continue
+			}
+
+			s.recordStat(func(st *SweeperStats) {
+				st.CompensatedPayments++
+				st.TotalSweptWorkflows++
+			})
+			log.Printf("[SWEEPER] Workflow %s timed out in PAYMENT after queue retries; initiated backward compensation at PAYMENT", wf.ID)
 
 		case shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT:
-			if wf.RetryCount < MaxRetries {
-				taskTimeout, stateTimeout := s.calculateRetryTimeout(wf.RetryCount)
-				nextRetry := wf.RetryCount + 1
+			// Escalate directly to BOOKING compensation so reserved seats are released.
+			seatIDs := db.ExtractSeatIDs(currentPayload)
+			taskTimeout, stateTimeout := s.calculateStateTimeout()
 
-				_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
-					WorkflowID:      wf.ID,
-					NextState:       wf.WorkflowState,
-					StateTimeoutSec: stateTimeout,
-					RetryCount:      nextRetry,
-					WorkerType:      shared_vars.PAYMENT_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     wf.ID.String(),
-						"action":          shared_vars.ACTION_COMPENSATE,
-						"reason":          fmt.Sprintf("Payment compensation retry (%d/%d)", nextRetry, MaxRetries),
-						"updated_at":      db.NewOutboxTimestamp(),
-						"timeout_seconds": taskTimeout,
-					},
-					TaskTimeoutSec: taskTimeout,
-				})
-				if err != nil {
-					log.Printf("[SWEEPER] Error updating workflow %s and inserting payment compensation retry outbox: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.TotalRetries++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Workflow %s timed out in COMPENSATING_PAYMENT; re-dispatched retry (%d/%d) with timeout %ds", wf.ID, nextRetry, MaxRetries, stateTimeout)
-			} else {
-				// Escalate directly to BOOKING compensation so reserved seats are released.
-				seatIDs := db.ExtractSeatIDs(currentPayload)
-				timeoutSec := s.taskTimeoutSec
-				stateTimeoutSec := timeoutSec + (s.taskTimeoutSec * 2)
-
-				currentPayload["timeout_escalation"] = map[string]any{
-					"escalated_from": string(shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT),
-					"escalated_at":   db.NewOutboxTimestamp(),
-					"reason":         fmt.Sprintf("Payment compensation timed out after %d retries; escalating directly to release booked seats", MaxRetries),
-				}
-
-				_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
-					WorkflowID:      wf.ID,
-					NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
-					WorkflowPayload: currentPayload,
-					StateTimeoutSec: stateTimeoutSec,
-					RetryCount:      0,
-					WorkerType:      shared_vars.BOOKING_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     wf.ID.String(),
-						"action":          shared_vars.ACTION_COMPENSATE,
-						"seat_ids":        seatIDs,
-						"reason":          "Payment compensation timed out; sweeping to release seats",
-						"updated_at":      db.NewOutboxTimestamp(),
-						"timeout_seconds": timeoutSec,
-					},
-					TaskTimeoutSec: timeoutSec,
-				})
-				if err != nil {
-					log.Printf("[SWEEPER] Error updating workflow %s and inserting booking compensation outbox: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.EscalatedCompensations++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Workflow %s exhausted all %d retries in COMPENSATING_PAYMENT; escalated to release seats in BOOKING", wf.ID, MaxRetries)
+			currentPayload["timeout_escalation"] = map[string]any{
+				"escalated_from": string(shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT),
+				"escalated_at":   db.NewOutboxTimestamp(),
+				"reason":         "Payment compensation timed out after queue retries exhausted; escalating directly to release booked seats",
 			}
+
+			_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
+				WorkflowID:      wf.ID,
+				NextState:       shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING,
+				WorkflowPayload: currentPayload,
+				StateTimeoutSec: stateTimeout,
+				RetryCount:      0,
+				WorkerType:      shared_vars.BOOKING_WORKER,
+				OutboxPayload: map[string]any{
+					"workflow_id":     wf.ID.String(),
+					"action":          shared_vars.ACTION_COMPENSATE,
+					"seat_ids":        seatIDs,
+					"reason":          "Payment compensation timed out; sweeping to release seats",
+					"updated_at":      db.NewOutboxTimestamp(),
+					"timeout_seconds": taskTimeout,
+				},
+				TaskTimeoutSec: taskTimeout,
+			})
+			if err != nil {
+				log.Printf("[SWEEPER] Error updating workflow %s and inserting booking compensation outbox: %v", wf.ID, err)
+				continue
+			}
+
+			s.recordStat(func(st *SweeperStats) {
+				st.EscalatedCompensations++
+				st.TotalSweptWorkflows++
+			})
+			log.Printf("[SWEEPER] Workflow %s timed out in COMPENSATING_PAYMENT after queue retries; escalated to release seats in BOOKING", wf.ID)
 
 		case shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING:
-			if wf.RetryCount < MaxRetries {
-				taskTimeout, stateTimeout := s.calculateRetryTimeout(wf.RetryCount)
-				nextRetry := wf.RetryCount + 1
-				seatIDs := db.ExtractSeatIDs(currentPayload)
-
-				_, err := db.TransitionWorkflowWithOutbox(sweepCtx, tx, db.TransitionParams{
-					WorkflowID:      wf.ID,
-					NextState:       wf.WorkflowState,
-					StateTimeoutSec: stateTimeout,
-					RetryCount:      nextRetry,
-					WorkerType:      shared_vars.BOOKING_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     wf.ID.String(),
-						"action":          shared_vars.ACTION_COMPENSATE,
-						"seat_ids":        seatIDs,
-						"reason":          fmt.Sprintf("Retrying booking compensation (attempt %d/%d)", nextRetry, MaxRetries),
-						"updated_at":      db.NewOutboxTimestamp(),
-						"timeout_seconds": taskTimeout,
-					},
-					TaskTimeoutSec: taskTimeout,
-				})
-				if err != nil {
-					log.Printf("[SWEEPER] Error updating workflow %s and inserting booking compensation retry outbox: %v", wf.ID, err)
-					continue
-				}
-
-				s.recordStat(func(st *SweeperStats) {
-					st.TotalRetries++
-					st.TotalSweptWorkflows++
-				})
-				log.Printf("[SWEEPER] Re-emitted booking compensation for %s (attempt %d/%d, timeout %ds)", wf.ID, nextRetry, MaxRetries, stateTimeout)
-			} else {
-				currentPayload["critical_alert"] = fmt.Sprintf("Booking compensation retries (%d attempts) exhausted. Manual operator intervention required.", MaxRetries)
-				if err := db.MarkWorkflowFailed(sweepCtx, tx, wf.ID, currentPayload); err != nil {
-					log.Printf("[SWEEPER] Error marking %s FAILED after exhausted booking compensation: %v", wf.ID, err)
-					continue
-				}
-				log.Printf("[CRITICAL OPERATOR ALERT] Workflow %s failed booking compensation after %d attempts; manual seat audit required", wf.ID, MaxRetries)
+			// Booking compensation timed out after queue retries exhausted.
+			// Mark terminal FAILED with critical operator alert for manual seat audit.
+			currentPayload["critical_alert"] = "Booking compensation timed out after queue retries exhausted. Manual operator intervention required to release seats."
+			if err := db.MarkWorkflowFailed(sweepCtx, tx, wf.ID, currentPayload); err != nil {
+				log.Printf("[SWEEPER] Error marking %s FAILED after booking compensation timeout: %v", wf.ID, err)
+				continue
 			}
+
+			s.recordStat(func(st *SweeperStats) {
+				st.TotalSweptWorkflows++
+			})
+			log.Printf("[CRITICAL OPERATOR ALERT] Workflow %s timed out in COMPENSATING_BOOKING after queue retries; manual seat audit required", wf.ID)
 
 		case shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED, shared_vars.ORCHESTRATOR_WORKFLOW_FAILED:
 			// Workflow already terminal, clear leftover state_timeout

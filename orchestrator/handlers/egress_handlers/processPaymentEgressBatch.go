@@ -61,63 +61,22 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	currentPayload := db.UnmarshalWorkflowPayload(wf.Payload)
 
-	// 1. Payment Failed -> Check retries before going to backward compensation
+	// 1. Payment Failed -> Queue retries handle transient errors; business failures trigger backward compensation
 	if egressPayload.Status == shared_vars.STATUS_FAILED {
-		const maxRetries = 1
 		timeoutSec, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.PaymentIngressVisibilityTimeout, shared_vars.PaymentEgressVisibilityTimeout)
 
 		// A. Handling Failure during Backward Compensation (COMPENSATING_PAYMENT)
 		if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_PAYMENT {
-			if wf.RetryCount < maxRetries {
-				newRetryCount := wf.RetryCount + 1
-				currentPayload["last_payment_compensation_failure"] = map[string]any{
-					"status":    egressPayload.Status,
-					"reason":    egressPayload.Reason,
-					"failed_at": db.NewOutboxTimestamp(),
-					"attempt":   newRetryCount,
-				}
-
-				_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
-					WorkflowID:      workflowUUID,
-					NextState:       wf.WorkflowState,
-					WorkflowPayload: currentPayload,
-					StateTimeoutSec: stateTimeoutSec,
-					RetryCount:      newRetryCount,
-					WorkerType:      shared_vars.PAYMENT_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     workflowUUID.String(),
-						"action":          shared_vars.ACTION_COMPENSATE,
-						"reason":          fmt.Sprintf("Payment compensation retry (attempt %d/%d): %s", newRetryCount, maxRetries, egressPayload.Reason),
-						"updated_at":      db.NewOutboxTimestamp(),
-						"timeout_seconds": timeoutSec,
-						"retry_count":     newRetryCount,
-					},
-					TaskTimeoutSec: timeoutSec,
-				})
-				if err != nil {
-					return false, fmt.Errorf("failed to retry payment compensation for workflow %s: %w", workflowUUID, err)
-				}
-				if err := tx.Commit(ctx); err != nil {
-					return false, fmt.Errorf("failed to commit retry transaction for workflow %s: %w", workflowUUID, err)
-				}
-
-				log.Printf("[RETRY] Payment compensation failed for workflow %s (attempt %d/%d): %s; re-emitted payment compensation task to outbox with timeout %ds",
-					workflowUUID, newRetryCount, maxRetries, egressPayload.Reason, timeoutSec)
-				return true, nil
-			}
-
-			// Payment compensation retries exhausted (>= 2):
 			// Escalate directly to COMPENSATING_BOOKING to release reserved seats, and record a critical operator alert!
 			seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
 			bookingTimeout, bookingStateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
 
 			currentPayload["payment_compensation_failure"] = map[string]any{
-				"status":            egressPayload.Status,
-				"reason":            egressPayload.Reason,
-				"failed_at":         db.NewOutboxTimestamp(),
-				"exhausted_retries": wf.RetryCount,
+				"status":    egressPayload.Status,
+				"reason":    egressPayload.Reason,
+				"failed_at": db.NewOutboxTimestamp(),
 			}
-			currentPayload["critical_operator_alert"] = fmt.Sprintf("Payment compensation failed after %d retries (%s); escalated to Booking seat release. Customer refund requires manual operator review.", wf.RetryCount, egressPayload.Reason)
+			currentPayload["critical_operator_alert"] = fmt.Sprintf("Payment compensation failed (%s); escalated to Booking seat release. Customer refund requires manual operator review.", egressPayload.Reason)
 
 			_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
 				WorkflowID:      workflowUUID,
@@ -130,7 +89,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 					"workflow_id":     workflowUUID.String(),
 					"action":          shared_vars.ACTION_COMPENSATE,
 					"seat_ids":        seatIDs,
-					"reason":          fmt.Sprintf("Payment compensation failed after %d retries; escalating to release seats", wf.RetryCount),
+					"reason":          fmt.Sprintf("Payment compensation failed (%s); escalating to release seats", egressPayload.Reason),
 					"updated_at":      db.NewOutboxTimestamp(),
 					"timeout_seconds": bookingTimeout,
 				},
@@ -143,7 +102,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 				return false, fmt.Errorf("failed to commit escalation transaction for %s: %w", workflowUUID, err)
 			}
 
-			log.Printf("[SAGA ESCALATION] Payment compensation failed for %s after exhausting %d retries; escalated to COMPENSATING_BOOKING to release seats", workflowUUID, wf.RetryCount)
+			log.Printf("[SAGA ESCALATION] Payment compensation failed for %s (%s); escalated to COMPENSATING_BOOKING to release seats", workflowUUID, egressPayload.Reason)
 			return true, nil
 		}
 
@@ -153,76 +112,11 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			return true, nil
 		}
 
-		if wf.RetryCount < maxRetries {
-			newRetryCount := wf.RetryCount + 1
-			currentPayload["last_payment_failure"] = map[string]any{
-				"status":    egressPayload.Status,
-				"reason":    egressPayload.Reason,
-				"failed_at": db.NewOutboxTimestamp(),
-				"attempt":   newRetryCount,
-			}
-
-			seatIDs := resolveEgressSeatIDs(egressPayload, currentPayload)
-
-			numSeats := egressPayload.NumSeats
-			if numSeats <= 0 {
-				if ns, ok := currentPayload["num_seats"].(float64); ok && ns > 0 {
-					numSeats = int(ns)
-				} else if len(seatIDs) > 0 {
-					numSeats = len(seatIDs)
-				}
-			}
-
-			amount := egressPayload.Amount
-			if amount <= 0 {
-				if am, ok := currentPayload["amount"].(float64); ok && am > 0 {
-					amount = int(am)
-				} else if numSeats > 0 {
-					amount = numSeats * 500
-				}
-			}
-
-			paymentRetryPayload := map[string]any{
-				"workflow_id":     workflowUUID.String(),
-				"seat_ids":        seatIDs,
-				"num_seats":       numSeats,
-				"amount":          amount,
-				"updated_at":      db.NewOutboxTimestamp(),
-				"timeout_seconds": timeoutSec,
-				"retry_count":     newRetryCount,
-			}
-			if pm := db.ExtractPaymentMethod(currentPayload); pm != "" {
-				paymentRetryPayload["payment_method"] = pm
-			}
-
-			_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
-				WorkflowID:      workflowUUID,
-				NextState:       wf.WorkflowState,
-				WorkflowPayload: currentPayload,
-				StateTimeoutSec: stateTimeoutSec,
-				RetryCount:      newRetryCount,
-				WorkerType:      shared_vars.PAYMENT_WORKER,
-				OutboxPayload:   paymentRetryPayload,
-				TaskTimeoutSec:  timeoutSec,
-			})
-			if err != nil {
-				return false, fmt.Errorf("failed to retry payment for workflow %s: %w", workflowUUID, err)
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return false, fmt.Errorf("failed to commit retry transaction for workflow %s: %w", workflowUUID, err)
-			}
-
-			log.Printf("[RETRY] Workflow %s payment failed (attempt %d/%d): %s; re-emitted payment task to outbox with timeout %ds",
-				workflowUUID, newRetryCount, maxRetries, egressPayload.Reason, timeoutSec)
-			return true, nil
-		}
-
-		// Retries exhausted (>= 2): Start backward compensation from PAYMENT backwards
+		// Forward payment failed (e.g. card declined): Start backward compensation immediately
 		currentPayload["payment_failure"] = map[string]any{
-			"status":            egressPayload.Status,
-			"reason":            egressPayload.Reason,
-			"failed_at":         db.NewOutboxTimestamp(),
-			"exhausted_retries": wf.RetryCount,
+			"status":    egressPayload.Status,
+			"reason":    egressPayload.Reason,
+			"failed_at": db.NewOutboxTimestamp(),
 		}
 
 		_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
@@ -248,7 +142,7 @@ func ProcessPaymentEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
 		}
 
-		log.Printf("[SAGA ROLLBACK] Payment failed for workflow %s after exhausting %d retries; started backward compensation at PAYMENT", workflowUUID, wf.RetryCount)
+		log.Printf("[SAGA ROLLBACK] Payment failed for workflow %s (%s); started backward compensation at PAYMENT", workflowUUID, egressPayload.Reason)
 		return true, nil
 	}
 

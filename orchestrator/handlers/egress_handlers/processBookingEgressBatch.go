@@ -51,11 +51,8 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 
 	currentPayload := db.UnmarshalWorkflowPayload(wf.Payload)
 
-	// 1. Booking Failed -> Check retries before marking whole workflow as FAILED
+	// 1. Booking Failed -> Queue retries handle transient errors; business/terminal failures fail immediately
 	if egressPayload.Status == shared_vars.STATUS_FAILED {
-		const maxRetries = 1
-		bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
-
 		// A. Handling Failure during Backward Compensation (COMPENSATING_BOOKING)
 		if wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPENSATING_BOOKING {
 			seatIDs := egressPayload.SeatIDs
@@ -63,53 +60,12 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 				seatIDs = db.ExtractSeatIDs(currentPayload)
 			}
 
-			if wf.RetryCount < maxRetries {
-				newRetryCount := wf.RetryCount + 1
-				currentPayload["last_booking_compensation_failure"] = map[string]any{
-					"status":    egressPayload.Status,
-					"reason":    egressPayload.Reason,
-					"failed_at": db.NewOutboxTimestamp(),
-					"attempt":   newRetryCount,
-				}
-
-				_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
-					WorkflowID:      workflowUUID,
-					NextState:       wf.WorkflowState,
-					WorkflowPayload: currentPayload,
-					StateTimeoutSec: stateTimeoutSec,
-					RetryCount:      newRetryCount,
-					WorkerType:      shared_vars.BOOKING_WORKER,
-					OutboxPayload: map[string]any{
-						"workflow_id":     workflowUUID.String(),
-						"action":          shared_vars.ACTION_COMPENSATE,
-						"seat_ids":        seatIDs,
-						"reason":          fmt.Sprintf("Booking compensation retry (attempt %d/%d): %s", newRetryCount, maxRetries, egressPayload.Reason),
-						"updated_at":      db.NewOutboxTimestamp(),
-						"timeout_seconds": bookingTimeout,
-						"retry_count":     newRetryCount,
-					},
-					TaskTimeoutSec: bookingTimeout,
-				})
-				if err != nil {
-					return false, fmt.Errorf("failed to retry booking compensation for %s: %w", workflowUUID, err)
-				}
-				if err := tx.Commit(ctx); err != nil {
-					return false, fmt.Errorf("failed to commit retry transaction for workflow %s: %w", workflowUUID, err)
-				}
-
-				log.Printf("[RETRY] Booking compensation failed for %s (attempt %d/%d): %s; re-emitted booking compensation task to outbox with timeout %ds",
-					workflowUUID, newRetryCount, maxRetries, egressPayload.Reason, bookingTimeout)
-				return true, nil
-			}
-
-			// Booking compensation retries exhausted (>= 2): mark terminal FAILED with critical operator alert.
 			currentPayload["booking_compensation_failure"] = map[string]any{
-				"status":            egressPayload.Status,
-				"reason":            egressPayload.Reason,
-				"failed_at":         db.NewOutboxTimestamp(),
-				"exhausted_retries": wf.RetryCount,
+				"status":    egressPayload.Status,
+				"reason":    egressPayload.Reason,
+				"failed_at": db.NewOutboxTimestamp(),
 			}
-			currentPayload["critical_operator_alert"] = fmt.Sprintf("Booking compensation failed after %d retries (%s); reserved seats (%v) may be leaked and require manual release.", wf.RetryCount, egressPayload.Reason, seatIDs)
+			currentPayload["critical_operator_alert"] = fmt.Sprintf("Booking compensation failed (%s); reserved seats (%v) may be leaked and require manual release.", egressPayload.Reason, seatIDs)
 
 			if err := db.MarkWorkflowFailed(ctx, tx, workflowUUID, currentPayload); err != nil {
 				return false, fmt.Errorf("failed to update workflow %s to FAILED: %w", workflowUUID, err)
@@ -118,7 +74,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 				return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
 			}
 
-			log.Printf("[CRITICAL ALERT] Booking compensation failed for %s after exhausting %d retries; marked as FAILED with operator alert", workflowUUID, wf.RetryCount)
+			log.Printf("[CRITICAL ALERT] Booking compensation failed for %s (%s); marked as FAILED with operator alert", workflowUUID, egressPayload.Reason)
 			return true, nil
 		}
 
@@ -132,58 +88,11 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			return true, nil
 		}
 
-		if wf.RetryCount < maxRetries {
-			newRetryCount := wf.RetryCount + 1
-			currentPayload["last_booking_failure"] = map[string]any{
-				"status":    egressPayload.Status,
-				"reason":    egressPayload.Reason,
-				"failed_at": db.NewOutboxTimestamp(),
-				"attempt":   newRetryCount,
-			}
-
-			numSeats := 0
-			if ns, ok := currentPayload["num_seats"].(float64); ok && ns > 0 {
-				numSeats = int(ns)
-			} else if egressPayload.NumSeats > 0 {
-				numSeats = egressPayload.NumSeats
-			} else if seatIDs := db.ExtractSeatIDs(currentPayload); len(seatIDs) > 0 {
-				numSeats = len(seatIDs)
-			}
-
-			_, err := db.TransitionWorkflowWithOutbox(ctx, tx, db.TransitionParams{
-				WorkflowID:      workflowUUID,
-				NextState:       wf.WorkflowState,
-				WorkflowPayload: currentPayload,
-				StateTimeoutSec: stateTimeoutSec,
-				RetryCount:      newRetryCount,
-				WorkerType:      shared_vars.BOOKING_WORKER,
-				OutboxPayload: map[string]any{
-					"workflow_id":     workflowUUID.String(),
-					"num_seats":       numSeats,
-					"updated_at":      db.NewOutboxTimestamp(),
-					"timeout_seconds": bookingTimeout,
-					"retry_count":     newRetryCount,
-				},
-				TaskTimeoutSec: bookingTimeout,
-			})
-			if err != nil {
-				return false, fmt.Errorf("failed to retry booking for workflow %s: %w", workflowUUID, err)
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return false, fmt.Errorf("failed to commit retry transaction for workflow %s: %w", workflowUUID, err)
-			}
-
-			log.Printf("[RETRY] Workflow %s booking failed (attempt %d/%d): %s; re-emitted booking task to outbox with timeout %ds",
-				workflowUUID, newRetryCount, maxRetries, egressPayload.Reason, bookingTimeout)
-			return true, nil
-		}
-
-		// Retries exhausted (>= 2): First step failed, no prior steps to compensate
+		// Forward booking failed (e.g. insufficient seats): Step 1 failed, 0 seats committed, no prior steps to compensate
 		currentPayload["booking_failure"] = map[string]any{
-			"status":            egressPayload.Status,
-			"reason":            egressPayload.Reason,
-			"failed_at":         db.NewOutboxTimestamp(),
-			"exhausted_retries": wf.RetryCount,
+			"status":    egressPayload.Status,
+			"reason":    egressPayload.Reason,
+			"failed_at": db.NewOutboxTimestamp(),
 		}
 		if err := db.MarkWorkflowFailed(ctx, tx, workflowUUID, currentPayload); err != nil {
 			return false, fmt.Errorf("failed to update workflow %s to FAILED: %w", workflowUUID, err)
@@ -192,7 +101,7 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 			return false, fmt.Errorf("failed to commit transaction for workflow %s: %w", workflowUUID, err)
 		}
 
-		log.Printf("Workflow %s booking failed after exhausting %d retries; marked as FAILED with no prior steps to compensate", workflowUUID, wf.RetryCount)
+		log.Printf("Workflow %s forward booking failed (%s); marked as FAILED with no prior steps to compensate", workflowUUID, egressPayload.Reason)
 		return true, nil
 	}
 
@@ -224,9 +133,40 @@ func ProcessBookingEgressMessage(ctx context.Context, msg *consumer.Message) (bo
 	}
 
 	if wf.WorkflowState != shared_vars.ORCHESTRATOR_WORKFLOW_BOOKING {
-		log.Printf("Workflow %s is in state %s (expected BOOKING); skipping advance to payment", workflowUUID, wf.WorkflowState)
+		log.Printf("Workflow %s booking completed message received, but state is %s (expected BOOKING)", workflowUUID, wf.WorkflowState)
 
-		// Ghost allocation prevention: Release seats if booking completed after workflow timed out/failed.
+		// Duplicate vs. Ghost allocation guard:
+		// If the workflow already accepted a booking (currently in PAYMENT or COMPLETED),
+		// compare incoming seat IDs with the already recorded seat IDs.
+		recordedSeats := db.ExtractSeatIDs(currentPayload)
+		if len(recordedSeats) > 0 && (wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_PAYMENT || wf.WorkflowState == shared_vars.ORCHESTRATOR_WORKFLOW_COMPLETED) {
+			recordedSet := make(map[string]bool)
+			for _, s := range recordedSeats {
+				recordedSet[s] = true
+			}
+
+			var extraGhostSeats []string
+			for _, s := range egressPayload.SeatIDs {
+				if !recordedSet[s] {
+					extraGhostSeats = append(extraGhostSeats, s)
+				}
+			}
+
+			// If all incoming seats were already legitimately recorded, this is a harmless duplicate delivery!
+			if len(extraGhostSeats) == 0 {
+				log.Printf("[DUPLICATE BOOKING ACKNOWLEDGED] Workflow %s is in state %s and already accepted seat allocation %v; acknowledging duplicate without compensation",
+					workflowUUID, wf.WorkflowState, recordedSeats)
+				return true, nil
+			}
+
+			// If there are extra unrecorded seats, compensate only the excess leaked seats!
+			log.Printf("[EXTRA GHOST SEATS DETECTED] Workflow %s in state %s already has %v, but duplicate egress contains extra seats %v; compensating extra seats only",
+				workflowUUID, wf.WorkflowState, recordedSeats, extraGhostSeats)
+			egressPayload.SeatIDs = extraGhostSeats
+		}
+
+		// Ghost allocation prevention: Release seats if booking completed after workflow timed out/failed,
+		// or if extra seats were erroneously reserved.
 		if len(egressPayload.SeatIDs) > 0 {
 			_, err := db.InsertOutbox(ctx, tx, workflowUUID, shared_vars.BOOKING_WORKER, map[string]any{
 				"workflow_id":     workflowUUID.String(),

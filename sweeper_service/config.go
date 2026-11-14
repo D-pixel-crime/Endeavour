@@ -9,10 +9,13 @@ import (
 )
 
 type Config struct {
-	DatabaseURL    string
-	PollInterval   time.Duration
-	BatchSize      int
-	TaskTimeoutSec int
+	DatabaseURL           string
+	PollInterval          time.Duration
+	BatchSize             int
+	TaskTimeoutSec        int
+	IngressMaxRetries     int
+	EgressMaxRetries      int
+	StageTimeoutBufferSec int
 }
 
 func LoadConfig() (*Config, error) {
@@ -77,10 +80,34 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
+	ingressRetries := 5
+	if s := os.Getenv("SQS_INGRESS_MAX_RETRIES"); s != "" {
+		if r, err := strconv.Atoi(s); err == nil && r > 0 {
+			ingressRetries = r
+		}
+	}
+
+	egressRetries := 3
+	if s := os.Getenv("SQS_EGRESS_MAX_RETRIES"); s != "" {
+		if r, err := strconv.Atoi(s); err == nil && r > 0 {
+			egressRetries = r
+		}
+	}
+
+	bufferSec := 10
+	if s := os.Getenv("STAGE_TIMEOUT_BUFFER_SECONDS"); s != "" {
+		if b, err := strconv.Atoi(s); err == nil && b >= 0 {
+			bufferSec = b
+		}
+	}
+
 	return &Config{
-		DatabaseURL:    dbURL,
-		PollInterval:   pollInterval,
-		BatchSize:      batchSize,
-		TaskTimeoutSec: taskTimeout,
+		DatabaseURL:           dbURL,
+		PollInterval:          pollInterval,
+		BatchSize:             batchSize,
+		TaskTimeoutSec:        taskTimeout,
+		IngressMaxRetries:     ingressRetries,
+		EgressMaxRetries:      egressRetries,
+		StageTimeoutBufferSec: bufferSec,
 	}, nil
 }

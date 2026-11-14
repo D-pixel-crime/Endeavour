@@ -29,6 +29,10 @@ func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, in
 	if len(maxConcurrency) > 0 && maxConcurrency[0] > 0 {
 		limit = maxConcurrency[0]
 	}
+	visTimeout := visibilityTimeout
+	if visTimeout <= 0 {
+		visTimeout = 30
+	}
 	return &Poller{
 		dbPool:            dbPool,
 		producer:          prod,
@@ -36,7 +40,7 @@ func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, in
 		interval:          interval,
 		batchSize:         batchSize,
 		maxConcurrency:    limit,
-		visibilityTimeout: visibilityTimeout,
+		visibilityTimeout: visTimeout,
 	}
 }
 
@@ -142,7 +146,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 			SELECT id
 			FROM outbox
 			WHERE (status IS NULL OR status != 'FAILED')
-			  AND (processing = false OR (processing = true AND updated_at < NOW() - INTERVAL '30 seconds'))
+			  AND (processing = false OR (processing = true AND updated_at < NOW() - make_interval(secs => $2)))
 			  AND (retry_count < 5)
 			ORDER BY updated_at
 			LIMIT $1
@@ -153,7 +157,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 		WHERE id IN (SELECT id FROM targets)
 		RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.timeout_seconds, outbox.updated_at`
 
-	rows, err := tx.Query(batchCtx, claimQuery, p.batchSize)
+	rows, err := tx.Query(batchCtx, claimQuery, p.batchSize, p.visibilityTimeout)
 	if err != nil {
 		log.Printf("Failed to query outbox: %v", err)
 		return

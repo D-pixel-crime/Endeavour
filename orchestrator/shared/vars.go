@@ -18,6 +18,10 @@ var (
 
 	BookingTaskTimeoutSeconds int
 	PaymentTaskTimeoutSeconds int
+
+	SQSIngressMaxRetries  int = 5
+	SQSEgressMaxRetries   int = 3
+	StageTimeoutBufferSec int = 10
 )
 
 type WorkerType string

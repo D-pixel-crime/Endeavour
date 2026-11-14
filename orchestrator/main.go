@@ -51,6 +51,22 @@ func main() {
 		}
 	}
 
+	if s := os.Getenv("SQS_INGRESS_MAX_RETRIES"); s != "" {
+		if r, err := strconv.Atoi(s); err == nil && r > 0 {
+			shared_vars.SQSIngressMaxRetries = r
+		}
+	}
+	if s := os.Getenv("SQS_EGRESS_MAX_RETRIES"); s != "" {
+		if r, err := strconv.Atoi(s); err == nil && r > 0 {
+			shared_vars.SQSEgressMaxRetries = r
+		}
+	}
+	if s := os.Getenv("STAGE_TIMEOUT_BUFFER_SECONDS"); s != "" {
+		if b, err := strconv.Atoi(s); err == nil && b >= 0 {
+			shared_vars.StageTimeoutBufferSec = b
+		}
+	}
+
 	var pollerWg sync.WaitGroup
 
 	shared_vars.BookingEgressQueueURL = os.Getenv("BOOKING_EGRESS_SQS_URL")

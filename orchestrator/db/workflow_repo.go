@@ -90,7 +90,8 @@ func ExtractPaymentMethod(payload map[string]any) string {
 }
 
 // ComputeStageTimeouts resolves task timeout and state timeout based on ingress and egress visibility timeouts.
-// State timeout is: (2 * ingressVis) + (2 * egressVis) + queue lag buffer (10s).
+// State timeout formula:
+// (SQSIngressMaxRetries * ingressVis) + (SQSEgressMaxRetries * egressVis) + StageTimeoutBufferSec
 func ComputeStageTimeouts(ingressVisSec, egressVisSec int32) (taskTimeoutSec int, stateTimeoutSec int) {
 	ingress := int(ingressVisSec)
 	if ingress <= 0 {
@@ -101,8 +102,9 @@ func ComputeStageTimeouts(ingressVisSec, egressVisSec int32) (taskTimeoutSec int
 		egress = 30
 	}
 	taskTimeoutSec = ingress
-	const queueLagBuffer = 10
-	stateTimeoutSec = (2 * ingress) + (2 * egress) + queueLagBuffer
+	stateTimeoutSec = (shared_vars.SQSIngressMaxRetries * ingress) +
+		(shared_vars.SQSEgressMaxRetries * egress) +
+		shared_vars.StageTimeoutBufferSec
 	return taskTimeoutSec, stateTimeoutSec
 }
 

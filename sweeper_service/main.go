@@ -42,7 +42,7 @@ func main() {
 		log.Fatalf("Failed to ping database: %v", err)
 	}
 
-	sweeper := NewSweeper(dbPool, cfg.PollInterval, cfg.BatchSize, cfg.TaskTimeoutSec)
+	sweeper := NewSweeper(dbPool, cfg.PollInterval, cfg.BatchSize, cfg.TaskTimeoutSec, cfg.IngressMaxRetries, cfg.EgressMaxRetries, cfg.StageTimeoutBufferSec)
 
 	log.Printf("Sweeper service running (interval: %v, batch size: %d)",
 		cfg.PollInterval, cfg.BatchSize)
