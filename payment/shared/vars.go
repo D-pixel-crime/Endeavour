@@ -15,9 +15,11 @@ var (
 type PaymentWorkflowState string
 
 const (
+	PAYMENT_WORKFLOW_PENDING      PaymentWorkflowState = "PENDING"
 	PAYMENT_WORKFLOW_COMPLETED    PaymentWorkflowState = "COMPLETED"
 	PAYMENT_WORKFLOW_FAILED       PaymentWorkflowState = "FAILED"
 	PAYMENT_WORKFLOW_COMPENSATING PaymentWorkflowState = "COMPENSATING"
+	PAYMENT_WORKFLOW_COMPENSATED  PaymentWorkflowState = "COMPENSATED"
 )
 
 const (

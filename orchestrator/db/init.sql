@@ -41,6 +41,7 @@ CREATE TABLE outbox (
 );
 
 CREATE INDEX idx_outbox_updated_at ON outbox(updated_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_workflow_id ON outbox(workflow_id);
 CREATE INDEX idx_workflows_state_timeout ON workflows(state_timeout) WHERE state_timeout IS NOT NULL;
 
 CREATE TABLE tickets (

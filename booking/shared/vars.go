@@ -15,9 +15,11 @@ var (
 type BookingWorkflowState string
 
 const (
+	BOOKING_WORKFLOW_PENDING      BookingWorkflowState = "PENDING"
 	BOOKING_WORKFLOW_COMPLETED    BookingWorkflowState = "COMPLETED"
 	BOOKING_WORKFLOW_FAILED       BookingWorkflowState = "FAILED"
 	BOOKING_WORKFLOW_COMPENSATING BookingWorkflowState = "COMPENSATING"
+	BOOKING_WORKFLOW_COMPENSATED  BookingWorkflowState = "COMPENSATED"
 )
 
 const (

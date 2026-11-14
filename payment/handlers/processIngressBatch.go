@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -30,11 +31,10 @@ type PaymentIngressPayload struct {
 	CustomerDetails *CustomerDetails `json:"customer_details,omitempty"`
 }
 
-func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, seatIDs []string, numSeats int, payloadBytes []byte) {
+func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action string, reason string, seatIDs []string, numSeats int, payloadBytes []byte) error {
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		log.Printf("Failed to begin transaction for recording payment failure: %v", err)
-		return
+		return fmt.Errorf("failed to begin transaction for recording payment failure: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -63,19 +63,23 @@ func emitPaymentFailure(ctx context.Context, workflowUUID uuid.UUID, action stri
 		VALUES ($4, $1, 'PAYMENT', $5, NOW())`
 
 	if _, err := tx.Exec(ctx, failQuery, workflowUUID, string(shared.PAYMENT_WORKFLOW_FAILED), payloadBytes, uuid.New(), failBytes); err != nil {
-		log.Printf("Failed to execute payment failure query for workflow %s: %v", workflowUUID, err)
-		return
+		return fmt.Errorf("failed to execute payment failure query for workflow %s: %w", workflowUUID, err)
 	}
-	_ = tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit failure transaction for workflow %s: %w", workflowUUID, err)
+	}
+	return nil
 }
 
 func writeOutboxResponse(ctx context.Context, tx pgx.Tx, workflowUUID uuid.UUID, payload map[string]any, label string) (bool, error) {
 	outboxBytes, _ := json.Marshal(payload)
-	_, _ = tx.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
 		 VALUES ($1, $2, 'PAYMENT', $3, NOW())`,
 		uuid.New(), workflowUUID, outboxBytes,
-	)
+	); err != nil {
+		return false, fmt.Errorf("failed to insert %s payment outbox: %w", label, err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("failed to commit %s payment outbox: %w", label, err)
 	}
@@ -87,10 +91,29 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 	workflowUUID := ingress.WorkflowID
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("failed to begin transaction for payment compensation: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// Mutex: Ensure workflow row exists and acquire lock
+	const initWorkflowLock = `
+		INSERT INTO workflows (id, workflow_state, payload)
+		VALUES ($1, 'PENDING', $2)
+		ON CONFLICT (id) DO NOTHING`
+	if _, err := tx.Exec(ctx, initWorkflowLock, workflowUUID, payloadBytes); err != nil {
+		return false, fmt.Errorf("failed to initialize workflow row for compensation: %w", err)
+	}
+
+	var existingState string
+	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
+	if err != nil {
+		return false, fmt.Errorf("failed to lock workflow row for compensation: %w", err)
+	}
+
+	if existingState == string(shared.PAYMENT_WORKFLOW_COMPENSATED) {
+		log.Printf("[PAYMENT COMPENSATION] Workflow %s is already COMPENSATED; skipping duplicate compensation", workflowUUID)
+		return true, nil
+	}
 
 	var paymentID uuid.UUID
 	var amount int
@@ -100,20 +123,21 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 		workflowUUID,
 	).Scan(&paymentID, &amount, &currentStatus)
 
-	if queryErr == nil {
+	if queryErr != nil {
+		if errors.Is(queryErr, pgx.ErrNoRows) {
+			log.Printf("[PAYMENT COMPENSATION] No payment record found for workflow %s; no money taken", workflowUUID)
+		} else {
+			return false, fmt.Errorf("failed to inspect payment for compensation: %w", queryErr)
+		}
+	} else {
 		if currentStatus == "COMPLETED" && amount > 0 {
-			_, err = tx.Exec(ctx, `UPDATE payments SET status = 'REFUNDED' WHERE workflow_id = $1`, workflowUUID)
-			if err != nil {
-				tx.Rollback(ctx)
-				emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
-				return true, nil
+			if _, err := tx.Exec(ctx, `UPDATE payments SET status = 'REFUNDED' WHERE workflow_id = $1`, workflowUUID); err != nil {
+				return false, fmt.Errorf("failed to update payment to REFUNDED: %w", err)
 			}
 			log.Printf("[PAYMENT COMPENSATION] Refunded amount %d for workflow %s", amount, workflowUUID)
 		} else {
 			log.Printf("[PAYMENT COMPENSATION] Payment status is '%s' for workflow %s; no money taken to refund", currentStatus, workflowUUID)
 		}
-	} else {
-		log.Printf("[PAYMENT COMPENSATION] No payment record found for workflow %s; no money taken", workflowUUID)
 	}
 
 	outboxPayload := map[string]any{
@@ -126,34 +150,28 @@ func handlePaymentCompensation(ctx context.Context, ingress PaymentIngressPayloa
 	}
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
-		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("failed to marshal payment compensation outbox payload: %w", err)
 	}
 
 	const compensateQuery = `
-		WITH upserted_workflow AS (
-			INSERT INTO workflows (id, workflow_state, payload)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (id) DO UPDATE
-			  SET workflow_state = EXCLUDED.workflow_state,
-			      payload = EXCLUDED.payload
+		WITH updated_workflow AS (
+			UPDATE workflows
+			SET workflow_state = $2,
+			    payload = $3
+			WHERE id = $1
 		)
 		INSERT INTO outbox (id, workflow_id, worker_type, payload, updated_at)
 		VALUES ($4, $1, 'PAYMENT', $5, NOW())`
 	_, err = tx.Exec(ctx, compensateQuery,
-		workflowUUID, string(shared.PAYMENT_WORKFLOW_FAILED), payloadBytes,
+		workflowUUID, string(shared.PAYMENT_WORKFLOW_COMPENSATED), payloadBytes,
 		uuid.New(), outboxPayloadBytes,
 	)
 	if err != nil {
-		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("failed to update workflow to COMPENSATED and insert outbox: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		emitPaymentFailure(ctx, workflowUUID, shared.ACTION_COMPENSATE, err.Error(), ingress.SeatIDs, ingress.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("payment compensation commit outcome is uncertain: %w", err)
 	}
 
 	log.Printf("[PAYMENT COMPENSATION] Successfully verified payments table for workflow %s and sent COMPENSATED outbox message", workflowUUID)
@@ -201,44 +219,61 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 
 	tx, err := shared.DBPool.Begin(ctx)
 	if err != nil {
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to begin transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
+	// Mutex: Ensure workflow row exists and acquire lock
+	const initWorkflowLock = `
+		INSERT INTO workflows (id, workflow_state, payload)
+		VALUES ($1, 'PENDING', $2)
+		ON CONFLICT (id) DO NOTHING`
+	if _, err := tx.Exec(ctx, initWorkflowLock, workflowUUID, payloadBytes); err != nil {
+		return false, fmt.Errorf("failed to initialize workflow row: %w", err)
+	}
+
 	var existingState string
 	err = tx.QueryRow(ctx, `SELECT workflow_state FROM workflows WHERE id = $1 FOR UPDATE`, workflowUUID).Scan(&existingState)
-	if err == nil {
-		switch existingState {
-		case string(shared.PAYMENT_WORKFLOW_COMPLETED):
-			var paymentID uuid.UUID
-			var currentAmount int
-			var pMethod string
-			_ = tx.QueryRow(ctx, `SELECT id, amount, payment_method FROM payments WHERE workflow_id = $1`, workflowUUID).Scan(&paymentID, &currentAmount, &pMethod)
-			return writeOutboxResponse(ctx, tx, workflowUUID, map[string]any{
-				"workflow_id":    workflowUUID.String(),
-				"status":         shared.STATUS_COMPLETED,
-				"amount":         currentAmount,
-				"payment_method": pMethod,
-				"payment_id":     paymentID.String(),
-				"seat_ids":       ingressPayload.SeatIDs,
-				"num_seats":      ingressPayload.NumSeats,
-				"updated_at":     time.Now().UTC().Format(time.RFC3339),
-			}, "COMPLETED")
+	if err != nil {
+		return false, fmt.Errorf("failed to lock workflow row: %w", err)
+	}
 
-		case string(shared.PAYMENT_WORKFLOW_FAILED):
-			return writeOutboxResponse(ctx, tx, workflowUUID, map[string]any{
-				"workflow_id": workflowUUID.String(),
-				"status":      shared.STATUS_FAILED,
-				"reason":      "Payment previously failed",
-				"updated_at":  time.Now().UTC().Format(time.RFC3339),
-			}, "FAILED")
-
-		case string(shared.PAYMENT_WORKFLOW_COMPENSATING):
-			tx.Rollback(ctx)
-			log.Printf("Workflow %s is in compensating state; skipping forward execution", workflowUUID)
-			return true, nil
+	switch existingState {
+	case string(shared.PAYMENT_WORKFLOW_COMPLETED):
+		var paymentID uuid.UUID
+		var currentAmount int
+		var pMethod string
+		if err := tx.QueryRow(ctx, `SELECT id, amount, payment_method FROM payments WHERE workflow_id = $1`, workflowUUID).Scan(&paymentID, &currentAmount, &pMethod); err != nil {
+			return false, fmt.Errorf("failed to query existing payment record: %w", err)
 		}
+		return writeOutboxResponse(ctx, tx, workflowUUID, map[string]any{
+			"workflow_id":    workflowUUID.String(),
+			"status":         shared.STATUS_COMPLETED,
+			"amount":         currentAmount,
+			"payment_method": pMethod,
+			"payment_id":     paymentID.String(),
+			"seat_ids":       ingressPayload.SeatIDs,
+			"num_seats":      ingressPayload.NumSeats,
+			"updated_at":     time.Now().UTC().Format(time.RFC3339),
+		}, "COMPLETED")
+
+	case string(shared.PAYMENT_WORKFLOW_COMPENSATED):
+		tx.Rollback(ctx)
+		log.Printf("Workflow %s is already COMPENSATED; skipping late payment execution", workflowUUID)
+		return true, nil
+
+	case string(shared.PAYMENT_WORKFLOW_COMPENSATING):
+		tx.Rollback(ctx)
+		log.Printf("Workflow %s is in compensating state; skipping forward execution", workflowUUID)
+		return true, nil
+
+	case string(shared.PAYMENT_WORKFLOW_FAILED):
+		return writeOutboxResponse(ctx, tx, workflowUUID, map[string]any{
+			"workflow_id": workflowUUID.String(),
+			"status":      shared.STATUS_FAILED,
+			"reason":      "Payment previously failed",
+			"updated_at":  time.Now().UTC().Format(time.RFC3339),
+		}, "FAILED")
 	}
 
 	// Deterministic payment_id derived from workflow UUID to ensure gateway idempotency
@@ -257,18 +292,16 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	outboxPayloadBytes, err := json.Marshal(outboxPayload)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to marshal outbox payload: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("failed to marshal outbox payload: %w", err)
 	}
 
 	outboxID := uuid.New()
 	const completePaymentQuery = `
-		WITH upserted_workflow AS (
-			INSERT INTO workflows (id, workflow_state, payload)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (id) DO UPDATE
-			  SET workflow_state = EXCLUDED.workflow_state,
-			      payload = EXCLUDED.payload
+		WITH updated_workflow AS (
+			UPDATE workflows
+			SET workflow_state = $2,
+			    payload = $3
+			WHERE id = $1
 		),
 		upserted_payment AS (
 			INSERT INTO payments (id, workflow_id, amount, payment_method, status, created_at)
@@ -287,13 +320,11 @@ func ProcessPaymentIngressMessage(ctx context.Context, msg *consumer.Message) (b
 	)
 	if err != nil {
 		tx.Rollback(ctx)
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to record completed payment and outbox: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("failed to record completed payment and outbox: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		emitPaymentFailure(ctx, workflowUUID, "", fmt.Sprintf("failed to commit transaction: %v", err), ingressPayload.SeatIDs, ingressPayload.NumSeats, payloadBytes)
-		return true, nil
+		return false, fmt.Errorf("payment commit outcome is uncertain: %w", err)
 	}
 
 	log.Printf("Workflow %s payment processed: state=COMPLETED amount=%d; outbox message %s created",

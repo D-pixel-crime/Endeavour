@@ -4,7 +4,8 @@ CREATE TYPE payment_workflow_state as ENUM (
     'PENDING',
     'COMPLETED',
     'FAILED',
-    'COMPENSATING'
+    'COMPENSATING',
+    'COMPENSATED'
 );
 
 CREATE TABLE workflows (
@@ -44,4 +45,5 @@ CREATE TABLE payments (
 );
 
 CREATE INDEX idx_outbox_updated_at ON outbox(updated_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_workflow_id ON outbox(workflow_id);
 CREATE INDEX idx_payments_workflow_id ON payments(workflow_id);

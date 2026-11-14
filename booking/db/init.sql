@@ -4,7 +4,8 @@ CREATE TYPE booking_workflow_state as ENUM (
     'PENDING',
     'COMPLETED',
     'FAILED',
-    'COMPENSATING'
+    'COMPENSATING',
+    'COMPENSATED'
     );
 
 CREATE TABLE workflows (
@@ -43,6 +44,7 @@ CREATE TABLE seat (
 );
 
 CREATE INDEX idx_outbox_updated_at ON outbox(updated_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_workflow_id ON outbox(workflow_id);
 CREATE INDEX idx_seat_available ON seat(train_id, seat_number) WHERE is_booked = false;
 CREATE INDEX idx_seat_booked_by ON seat(booked_by_workflow_id) WHERE booked_by_workflow_id IS NOT NULL;
 

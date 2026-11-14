@@ -143,12 +143,18 @@ func (p *Poller) processBatch(ctx context.Context) {
 
 	const claimQuery = `
 		WITH targets AS (
-			SELECT id
-			FROM outbox
-			WHERE (status IS NULL OR status != 'FAILED')
-			  AND (processing = false OR (processing = true AND updated_at < NOW() - make_interval(secs => $2)))
-			  AND (retry_count < 5)
-			ORDER BY updated_at
+			SELECT o1.id
+			FROM outbox o1
+			WHERE (o1.status IS NULL OR o1.status != 'FAILED')
+			  AND (o1.processing = false OR (o1.processing = true AND o1.updated_at < NOW() - make_interval(secs => $2)))
+			  AND (o1.retry_count < 5)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM outbox o2
+			      WHERE o2.workflow_id = o1.workflow_id
+			        AND o2.id != o1.id
+			        AND (o2.processing = true OR o2.updated_at < o1.updated_at)
+			  )
+			ORDER BY o1.updated_at
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
