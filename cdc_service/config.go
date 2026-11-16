@@ -24,6 +24,7 @@ type Config struct {
 	PollInterval      time.Duration
 	BatchSize         int
 	VisibilityTimeout int
+	MaxRetries        int
 
 	TargetQueueURL string
 	TargetQueues   map[string]string
@@ -102,6 +103,21 @@ func LoadConfig() (*Config, error) {
 	visTimeoutSec, err := strconv.Atoi(visTimeoutStr)
 	if err != nil || visTimeoutSec <= 0 {
 		return nil, fmt.Errorf("invalid CDC_VISIBILITY_TIMEOUT_SECONDS '%s': must be a positive integer", visTimeoutStr)
+	}
+
+	maxRetries := 5
+	if mrStr := os.Getenv("CDC_MAX_RETRIES"); mrStr != "" {
+		if parsed, err := strconv.Atoi(mrStr); err == nil && parsed > 0 {
+			maxRetries = parsed
+		}
+	} else if mrStr := os.Getenv("CDC_OUTBOX_MAX_RETRIES"); mrStr != "" {
+		if parsed, err := strconv.Atoi(mrStr); err == nil && parsed > 0 {
+			maxRetries = parsed
+		}
+	} else if mrStr := os.Getenv("OUTBOX_MAX_RETRIES"); mrStr != "" {
+		if parsed, err := strconv.Atoi(mrStr); err == nil && parsed > 0 {
+			maxRetries = parsed
+		}
 	}
 
 	targetQueues := make(map[string]string)
@@ -198,6 +214,7 @@ func LoadConfig() (*Config, error) {
 		PollInterval:      time.Duration(intervalSec) * time.Second,
 		BatchSize:         batchSize,
 		VisibilityTimeout: visTimeoutSec,
+		MaxRetries:        maxRetries,
 		TargetQueueURL:    singleQueueURL,
 		TargetQueues:      targetQueues,
 	}, nil

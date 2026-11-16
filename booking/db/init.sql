@@ -48,7 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_outbox_workflow_id ON outbox(workflow_id);
 CREATE INDEX idx_seat_available ON seat(train_id, seat_number) WHERE is_booked = false;
 CREATE INDEX idx_seat_booked_by ON seat(booked_by_workflow_id) WHERE booked_by_workflow_id IS NOT NULL;
 
--- Initial Seed of 100 Seats
+-- Initial Seed of 10,000 Seats
 
 INSERT INTO seat (train_id, seat_number)
 SELECT

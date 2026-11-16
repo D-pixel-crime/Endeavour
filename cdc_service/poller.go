@@ -22,9 +22,10 @@ type Poller struct {
 	batchSize         int
 	maxConcurrency    int
 	visibilityTimeout int
+	maxRetries        int
 }
 
-func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, interval time.Duration, batchSize int, visibilityTimeout int, maxConcurrency ...int) *Poller {
+func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, interval time.Duration, batchSize int, visibilityTimeout int, maxRetries int, maxConcurrency ...int) *Poller {
 	limit := 5
 	if len(maxConcurrency) > 0 && maxConcurrency[0] > 0 {
 		limit = maxConcurrency[0]
@@ -32,6 +33,10 @@ func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, in
 	visTimeout := visibilityTimeout
 	if visTimeout <= 0 {
 		visTimeout = 30
+	}
+	mRetries := maxRetries
+	if mRetries <= 0 {
+		mRetries = 5
 	}
 	return &Poller{
 		dbPool:            dbPool,
@@ -41,6 +46,7 @@ func NewPoller(dbPool *pgxpool.Pool, prod *producer.Producer, router *Router, in
 		batchSize:         batchSize,
 		maxConcurrency:    limit,
 		visibilityTimeout: visTimeout,
+		maxRetries:        mRetries,
 	}
 }
 
@@ -147,7 +153,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 			FROM outbox o1
 			WHERE (o1.status IS NULL OR o1.status != 'FAILED')
 			  AND (o1.processing = false OR (o1.processing = true AND o1.updated_at < NOW() - make_interval(secs => $2)))
-			  AND (o1.retry_count < 5)
+			  AND (o1.retry_count < $3)
 			  AND NOT EXISTS (
 			      SELECT 1 FROM outbox o2
 			      WHERE o2.workflow_id = o1.workflow_id
@@ -163,7 +169,7 @@ func (p *Poller) processBatch(ctx context.Context) {
 		WHERE id IN (SELECT id FROM targets)
 		RETURNING outbox.id, outbox.workflow_id, outbox.worker_type, outbox.payload, outbox.timeout_seconds, outbox.updated_at`
 
-	rows, err := tx.Query(batchCtx, claimQuery, p.batchSize, p.visibilityTimeout)
+	rows, err := tx.Query(batchCtx, claimQuery, p.batchSize, p.visibilityTimeout, p.maxRetries)
 	if err != nil {
 		log.Printf("Failed to query outbox: %v", err)
 		return
@@ -292,11 +298,11 @@ func (p *Poller) processBatch(ctx context.Context) {
 			UPDATE outbox
 			SET processing = false,
 			    retry_count = retry_count + 1,
-			    status = CASE WHEN retry_count + 1 >= 5 THEN 'FAILED' ELSE status END,
+			    status = CASE WHEN retry_count + 1 >= $3 THEN 'FAILED' ELSE status END,
 			    updated_at = NOW()
 			WHERE id = ANY($2::uuid[])`
 
-		if _, err := tx.Exec(batchCtx, finalizeQuery, toDelete, toUpdate); err != nil {
+		if _, err := tx.Exec(batchCtx, finalizeQuery, toDelete, toUpdate, p.maxRetries); err != nil {
 			log.Printf("Failed to update outbox messages: %v", err)
 			return
 		}

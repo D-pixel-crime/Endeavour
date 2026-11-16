@@ -44,7 +44,7 @@ func main() {
 
 	sqsProducer := producer.NewProducer(sqsClient, cfg.TargetQueueURL)
 	router := NewRouter(cfg)
-	poller := NewPoller(dbPool, sqsProducer, router, cfg.PollInterval, cfg.BatchSize, cfg.VisibilityTimeout)
+	poller := NewPoller(dbPool, sqsProducer, router, cfg.PollInterval, cfg.BatchSize, cfg.VisibilityTimeout, cfg.MaxRetries)
 
 	log.Printf("CDC service [%s] running in %s mode (interval: %v)",
 		cfg.ServiceName, cfg.Mode, cfg.PollInterval)

@@ -127,7 +127,7 @@ func CreateWorkflow(c *gin.Context) {
 		return
 	}
 
-	// stateTimeout = 2 * ingressVis + 2 * egressVis + 10s buffer
+	// stateTimeout = (R_in * ingressVis) + (R_eg * egressVis) + buffer
 	bookingTimeout, stateTimeoutSec := db.ComputeStageTimeouts(shared_vars.BookingIngressVisibilityTimeout, shared_vars.BookingEgressVisibilityTimeout)
 
 	bookingOutboxPayload := map[string]any{
